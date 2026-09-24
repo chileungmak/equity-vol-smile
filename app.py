@@ -807,43 +807,59 @@ def main() -> None:
             st.plotly_chart(fig_vol, use_container_width=True)
 
     with tab_math:
+        st.subheader("1. Theoretical Black-Scholes Pricing Framework")
         st.markdown(
-            r"""
-            ### Quantitative Mathematics: Black-Scholes Model Inversion
+            "For a non-dividend paying underlying asset with spot price $S$, strike $K$, "
+            "annualized time to maturity $T$, risk-free rate $r$, and constant volatility $\\sigma$:"
+        )
+        st.latex(r"C(S, K, T, r, \sigma) = S \cdot N(d_1) - K e^{-rT} \cdot N(d_2)")
+        st.latex(r"P(S, K, T, r, \sigma) = K e^{-rT} \cdot N(-d_2) - S \cdot N(-d_1)")
+        st.markdown(
+            "where $N(x)$ denotes the standard normal cumulative distribution function (CDF), and:"
+        )
+        st.latex(
+            r"d_1 = \frac{\ln(S / K) + \left(r + \frac{1}{2}\sigma^2\right)T}{\sigma \sqrt{T}}, \quad d_2 = d_1 - \sigma \sqrt{T}"
+        )
 
-            #### 1. Theoretical Black-Scholes Pricing Framework
-            For a non-dividend paying underlying asset with spot price $S$, strike $K$, annualized time to maturity $T$, risk-free rate $r$, and constant volatility $\sigma$:
+        st.divider()
 
-            $$\begin{aligned}
-            C(S, K, T, r, \sigma) &= S N(d_1) - K e^{-rT} N(d_2) \\
-            P(S, K, T, r, \sigma) &= K e^{-rT} N(-d_2) - S N(-d_1)
-            \end{aligned}$$
+        st.subheader("2. Reverse-Engineering Implied Volatility (IV)")
+        st.markdown(
+            "Observed option market quotes trade at mid-price $P_{\\text{market}} = \\frac{\\text{Bid} + \\text{Ask}}{2}$. "
+            "Implied Volatility $\\sigma$ is the unique positive root satisfying the non-linear pricing equation:"
+        )
+        st.latex(r"f(\sigma) = \text{BS}(S, K, T, r, \sigma) - P_{\text{market}} = 0")
+        st.markdown(
+            "Because no closed-form analytical inverse exists for $N(d_1)$, we apply a two-tier numerical solver:"
+        )
 
-            where $N(x)$ denotes the standard normal cumulative distribution function (CDF), and:
+        st.markdown(
+            "**Tier 1 — Primary Solver: Newton-Raphson Method**  \n"
+            "Achieves rapid quadratic convergence utilizing the analytical Vega derivative "
+            "$\\nu = \\frac{\\partial \\text{BS}}{\\partial \\sigma} = S \\sqrt{T} \\phi(d_1)$:"
+        )
+        st.latex(
+            r"\sigma_{n+1} = \sigma_n - \frac{\text{BS}(S, K, T, r, \sigma_n) - P_{\text{market}}}{\nu(S, K, T, r, \sigma_n)}"
+        )
 
-            $$d_1 = \frac{\ln(S/K) + \left(r + \frac{1}{2}\sigma^2\right)T}{\sigma \sqrt{T}}, \quad d_2 = d_1 - \sigma \sqrt{T}$$
+        st.markdown(
+            "**Tier 2 — Fallback Solver: Brent's Root-Finding (`scipy.optimize.brentq`)**  \n"
+            "If Vega vanishes in deep out-of-the-money / in-the-money wings ($\\nu < 10^{-8}$) or if Newton-Raphson iterates "
+            "outside the realistic bounds $[\sigma_{\\min}, \sigma_{\\max}] = [0.01\\%, 500\\%]$, the engine immediately falls back to Brent's method. "
+            "Brent's algorithm combines bisection, secant method, and inverse quadratic interpolation, guaranteeing convergence within the bounded bracket."
+        )
 
-            #### 2. Reverse-Engineering Implied Volatility ($\sigma_{IV}$)
-            Observed option market quotes trade at mid-price $P_{\text{market}} = \frac{\text{Bid} + \text{Ask}}{2}$. Implied Volatility is the unique parameter satisfying:
+        st.divider()
 
-            $$f(\sigma) = \text{BS}(S, K, T, r, \sigma) - P_{\text{market}} = 0$$
-
-            Because no closed-form analytical inverse exists for $N(d_1)$, we apply a two-tier numerical solver:
-
-            1. **Primary Solver — Newton-Raphson Method**:
-               Quadratic convergence via analytical Vega derivative $\nu = \frac{\partial \text{BS}}{\partial \sigma} = S \sqrt{T} \phi(d_1)$:
-               $$\sigma_{n+1} = \sigma_n - \frac{\text{BS}(S, K, T, r, \sigma_n) - P_{\text{market}}}{\nu(S, K, T, r, \sigma_n)}$$
-
-            2. **Fallback Solver — Brent's Root-Finding (`brentq`)**:
-               If $\nu < 10^{-8}$ (vanishing Vega in deep OTM/ITM wings) or Newton steps outside $[\sigma_{\min}, \sigma_{\max}] = [0.01\%, 500\%]$, the solver falls back to Brent's algorithm, ensuring robust root bracketing without numerical instability.
-
-            #### 3. No-Arbitrage Theoretical Boundaries
-            In real-world markets, stale quotes and illiquidity can yield market prices violating lower or upper arbitrage boundaries:
-            - **Call Boundary**: $\max(0, S - K e^{-rT}) < C_{\text{market}} < S$
-            - **Put Boundary**: $\max(0, K e^{-rT} - S) < P_{\text{market}} < K e^{-rT}$
-
-            Our pipeline sanitizes options chains before inversion, tagging non-convergent contracts and filtering out arbitrage violations.
-            """
+        st.subheader("3. No-Arbitrage Theoretical Boundaries")
+        st.markdown(
+            "In real-world markets, stale quotes and illiquidity can yield market prices violating lower or upper theoretical arbitrage bounds:"
+        )
+        st.latex(r"\text{Call Boundary: } \max\left(0, S - K e^{-rT}\right) < C_{\text{market}} < S")
+        st.latex(r"\text{Put Boundary: } \max\left(0, K e^{-rT} - S\right) < P_{\text{market}} < K e^{-rT}")
+        st.markdown(
+            "Our data cleaning pipeline pre-filters options violating these fundamental no-arbitrage boundaries, "
+            "preventing numerical divergence before the root-finder is invoked."
         )
 
 
