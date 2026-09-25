@@ -8,11 +8,52 @@ Implied Volatility (IV) from market mid-prices.
 from typing import Literal, Optional
 import numpy as np
 import pandas as pd
+from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq
 from scipy.stats import norm
 import streamlit as st
 
 OptionType = Literal["call", "put"]
+
+
+def build_yield_curve_spline(tenors: np.ndarray, rates: np.ndarray) -> CubicSpline:
+    """Build a cubic spline interpolation for the yield curve.
+
+    Parameters
+    ----------
+    tenors : np.ndarray
+        Array of term-structure tenors in years.
+    rates : np.ndarray
+        Array of corresponding risk-free rates (decimals).
+
+    Returns
+    -------
+    CubicSpline
+        A callable cubic spline object.
+    """
+    return CubicSpline(tenors, rates, bc_type='natural')
+
+
+def get_risk_free_rate(spline: CubicSpline, T: float) -> float:
+    """Extract the interpolated risk-free rate for a specific time to maturity.
+    
+    Clamps the time to maturity to the min/max known tenors to avoid wild
+    polynomial extrapolation artifacts at the boundaries.
+
+    Parameters
+    ----------
+    spline : CubicSpline
+        The fitted yield curve spline.
+    T : float
+        Time to maturity in years.
+
+    Returns
+    -------
+    float
+        Interpolated risk-free rate.
+    """
+    T_clamped = np.clip(T, spline.x[0], spline.x[-1])
+    return float(spline(T_clamped))
 
 
 def black_scholes_price(

@@ -17,10 +17,13 @@ from data_pipeline import (
     clean_options_data,
     fetch_option_chain_raw,
     fetch_ticker_metadata,
+    fetch_yield_curve,
 )
 from options_math import (
     black_scholes_price,
     calculate_chain_implied_volatility,
+    build_yield_curve_spline,
+    get_risk_free_rate,
 )
 
 # ---------------------------------------------------------
@@ -361,17 +364,24 @@ def main() -> None:
 
         T, dte = calculate_time_to_expiration(selected_expiry)
 
-        # 3. Macro Financial Parameters
+        # 3. Macro Financial Parameters (Dynamic Yield Curve)
         st.subheader("3. Macro Environment")
-        risk_free_rate = st.number_input(
-            "Risk-Free Rate (r)",
-            min_value=0.00,
-            max_value=0.20,
-            value=0.045,
-            step=0.0025,
-            format="%.4f",
-            help="Annualized continuously-compounded risk-free interest rate (e.g. 0.045 for 4.5%).",
-        )
+        
+        try:
+            with st.spinner("Fetching FRED Yield Curve..."):
+                yc_tenors, yc_rates = fetch_yield_curve()
+            yield_spline = build_yield_curve_spline(yc_tenors, yc_rates)
+            risk_free_rate = get_risk_free_rate(yield_spline, T)
+            
+            st.metric(
+                "Interpolated Risk-Free Rate",
+                f"{risk_free_rate * 100:.3f}%",
+                help=f"Dynamically interpolated from US Treasury spline for T={T:.3f} years."
+            )
+        except Exception as e:
+            st.error("Yield Curve API error. Using fallback 4.5%.")
+            risk_free_rate = 0.045
+            st.metric("Fallback Risk-Free Rate", "4.500%")
 
         # 4. Data Cleaning & Microstructure Filters
         with st.expander("🧹 Order Book Cleaning Filters", expanded=False):
@@ -624,10 +634,11 @@ def main() -> None:
     # ---------------------------------------------------------
     # Analytics & Diagnostics Tabs
     # ---------------------------------------------------------
-    tab_data, tab_micro, tab_math = st.tabs(
+    tab_data, tab_micro, tab_yield, tab_math = st.tabs(
         [
             "📊 Cleaned Options Chain Data",
             "🔍 Market Microstructure & Liquidity",
+            "📈 Yield Curve Term Structure",
             "📐 Quantitative Math & Inversion Architecture",
         ]
     )
@@ -805,6 +816,69 @@ def main() -> None:
                 margin=dict(l=40, r=20, t=50, b=40),
             )
             st.plotly_chart(fig_vol, use_container_width=True)
+
+    with tab_yield:
+        st.caption("Live US Treasury yield curve fetched from FRED, interpolated via natural Cubic Spline.")
+        
+        try:
+            fig_yc = go.Figure()
+            
+            # Generate smooth points for spline curve
+            t_smooth = np.linspace(yc_tenors[0], yc_tenors[-1], 200)
+            r_smooth = yield_spline(t_smooth)
+            
+            # Plot continuous spline
+            fig_yc.add_trace(
+                go.Scatter(
+                    x=t_smooth,
+                    y=r_smooth * 100.0,
+                    mode="lines",
+                    name="Cubic Spline",
+                    line=dict(color="#FF7043", width=2, shape="spline"),
+                    hoverinfo="skip"
+                )
+            )
+            
+            # Plot FRED data points
+            fig_yc.add_trace(
+                go.Scatter(
+                    x=yc_tenors,
+                    y=yc_rates * 100.0,
+                    mode="markers",
+                    name="FRED Data (Constant Maturity)",
+                    marker=dict(color="#00D4FF", size=8),
+                    hovertemplate="Tenor: %{x:.2f} yrs<br>Yield: %{y:.3f}%<extra></extra>"
+                )
+            )
+            
+            # Plot exact interpolated rate for selected option
+            fig_yc.add_trace(
+                go.Scatter(
+                    x=[T],
+                    y=[risk_free_rate * 100.0],
+                    mode="markers",
+                    name=f"Selected Expiry (T={T:.3f})",
+                    marker=dict(color="#00FF00", size=12, symbol="star"),
+                    hovertemplate="<b>Selected Option Maturity</b><br>Tenor: %{x:.3f} yrs<br>Interpolated Rate: %{y:.3f}%<extra></extra>"
+                )
+            )
+            
+            fig_yc.update_layout(
+                title="Dynamic Risk-Free Rate Interpolation",
+                xaxis_title="Tenor (Years)",
+                yaxis_title="Yield (%)",
+                template="plotly_dark",
+                paper_bgcolor="#0D1117",
+                plot_bgcolor="#0D1117",
+                height=450,
+                margin=dict(l=40, r=20, t=50, b=40),
+                legend=dict(x=0.02, y=0.98)
+            )
+            st.plotly_chart(fig_yc, use_container_width=True)
+            
+            st.info(f"**Selected Rate**: The numerical solver is currently using **{risk_free_rate * 100:.3f}%** to evaluate the {selected_expiry} option chain.")
+        except Exception as e:
+            st.warning("Yield curve plot is currently unavailable.")
 
     with tab_math:
         st.subheader("1. Theoretical Black-Scholes Pricing Framework")

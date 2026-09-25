@@ -5,12 +5,49 @@ applies microstructure filters (volume, bid-ask spreads, arbitrage bounds),
 and computes contract metrics (mid-prices, moneyness, time-to-expiration).
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
+import pandas_datareader.data as web
 import streamlit as st
 import yfinance as yf
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yield_curve() -> Tuple[np.ndarray, np.ndarray]:
+    """Fetch latest US Treasury yield curve from FRED.
+
+    Cached for 1 hour to prevent excessive API calls. Falls back to a flat
+    rate curve if the network request fails.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        (tenors_in_years, rates_as_decimals)
+    """
+    tickers = ['DGS1MO', 'DGS3MO', 'DGS6MO', 'DGS1', 'DGS2', 'DGS3', 'DGS5', 'DGS7', 'DGS10', 'DGS20', 'DGS30']
+    tenors = np.array([1/12, 3/12, 6/12, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0])
+    
+    try:
+        end_date = datetime.today()
+        # Look back 30 days to guarantee at least one valid trading day is retrieved
+        start_date = end_date - timedelta(days=30)
+        df = web.DataReader(tickers, 'fred', start_date, end_date)
+        
+        # Forward fill missing values (e.g. holidays) and grab the latest row
+        df = df.ffill().dropna()
+        if df.empty:
+            raise ValueError("FRED returned empty yield curve data.")
+            
+        # Convert percentages to decimals (e.g., 4.5% -> 0.045)
+        latest_rates = df.iloc[-1].values / 100.0
+        return tenors, latest_rates
+        
+    except Exception as exc:
+        # Fallback to a flat 4.5% risk-free rate if API fails
+        print(f"Warning: Failed to fetch FRED yield curve ({exc}). Falling back to flat 4.5% rate.")
+        return tenors, np.full_like(tenors, 0.045)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
