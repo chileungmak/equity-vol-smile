@@ -24,6 +24,8 @@ from options_math import (
     calculate_chain_implied_volatility,
     build_yield_curve_spline,
     get_risk_free_rate,
+    calculate_bid_ask_iv_chain,
+    calculate_countering_iv,
 )
 
 # ---------------------------------------------------------
@@ -634,12 +636,13 @@ def main() -> None:
     # ---------------------------------------------------------
     # Analytics & Diagnostics Tabs
     # ---------------------------------------------------------
-    tab_data, tab_micro, tab_yield, tab_math = st.tabs(
+    tab_data, tab_micro, tab_yield, tab_math, tab_scenario = st.tabs(
         [
             "📊 Cleaned Options Chain Data",
             "🔍 Market Microstructure & Liquidity",
             "📈 Yield Curve Term Structure",
             "📐 Quantitative Math & Inversion Architecture",
+            "🛠️ Interactive Scenario Pricer",
         ]
     )
 
@@ -935,6 +938,167 @@ def main() -> None:
             "Our data cleaning pipeline pre-filters options violating these fundamental no-arbitrage boundaries, "
             "preventing numerical divergence before the root-finder is invoked."
         )
+
+
+    with tab_scenario:
+        st.subheader("Interactive Scenario Pricer & Volatility Band Analysis")
+        st.markdown("Stress test market implied volatility against your custom assumptions and evaluate Put-Call parity dynamics.")
+
+        sc_col1, sc_col2 = st.columns(2)
+        with sc_col1:
+            sc_option_type = st.radio("Option Type", ["Call", "Put"], horizontal=True, key="sc_opt_type")
+            sc_type = "call" if sc_option_type == "Call" else "put"
+        
+        valid_chain = calls_iv if sc_type == "call" else puts_iv
+        if valid_chain.empty:
+            st.warning(f"No valid {sc_option_type} options available.")
+        else:
+            with sc_col2:
+                sc_strike = st.selectbox("Select Strike Price", options=valid_chain["strike"].tolist(), key="sc_strike_sel")
+
+            selected_opt = valid_chain[valid_chain["strike"] == sc_strike].iloc[0]
+            default_iv = float(selected_opt["iv_pct"])
+            market_price = float(selected_opt["mid_price"])
+            
+            st.divider()
+
+            # State management for inputs
+            rf_key = f"sc_rf_{sc_strike}_{sc_type}"
+            iv_key = f"sc_iv_{sc_strike}_{sc_type}"
+
+            def reset_scenario():
+                st.session_state[rf_key] = float(risk_free_rate * 100)
+                st.session_state[iv_key] = default_iv
+            
+            if rf_key not in st.session_state:
+                st.session_state[rf_key] = float(risk_free_rate * 100)
+            if iv_key not in st.session_state:
+                st.session_state[iv_key] = default_iv
+
+            reset_col, _, _ = st.columns([1, 1, 2])
+            with reset_col:
+                st.button("🔄 Reset to Market Defaults", on_click=reset_scenario)
+
+            sc_in1, sc_in2 = st.columns(2)
+            with sc_in1:
+                custom_rf_pct = st.number_input(
+                    "Custom Risk-Free Rate (%)", 
+                    value=st.session_state[rf_key],
+                    step=0.1, 
+                    key=rf_key
+                )
+                custom_rf = custom_rf_pct / 100.0
+            
+            with sc_in2:
+                custom_iv_pct = st.number_input(
+                    "Custom Implied Volatility (%)", 
+                    value=st.session_state[iv_key],
+                    step=1.0, 
+                    key=iv_key
+                )
+                custom_iv = custom_iv_pct / 100.0
+
+            with st.spinner("Calculating Volatility Band..."):
+                band_df = calculate_bid_ask_iv_chain(
+                    valid_chain, 
+                    S=spot_price, 
+                    T=T, 
+                    r=custom_rf, 
+                    option_type=sc_type, 
+                    tol=solver_tol, 
+                    max_iter=max_iterations
+                )
+
+            selected_band = band_df[band_df["strike"] == sc_strike].iloc[0]
+            
+            # Countering IV logic
+            counter_chain = puts_iv if sc_type == "call" else calls_iv
+            counter_opt = counter_chain[counter_chain["strike"] == sc_strike]
+            
+            counter_iv_pct = np.nan
+            if not counter_opt.empty:
+                counter_opt_data = counter_opt.iloc[0]
+                counter_market_price = float(counter_opt_data["mid_price"])
+                counter_actual_type = "put" if sc_type == "call" else "call"
+                
+                # Calculate the synthetic/theoretical IV of the SELECTED option based on the COUNTERING option's price
+                counter_iv = calculate_countering_iv(
+                    price=counter_market_price,
+                    S=spot_price,
+                    K=sc_strike,
+                    T=T,
+                    r_custom=custom_rf,
+                    original_option_type=counter_actual_type
+                )
+                if not np.isnan(counter_iv):
+                    counter_iv_pct = counter_iv * 100.0
+
+            fig_sc = go.Figure()
+            
+            valid_band = band_df.dropna(subset=["bid_iv_pct", "ask_iv_pct"])
+            if not valid_band.empty:
+                fig_sc.add_trace(go.Scatter(
+                    x=valid_band["strike"],
+                    y=valid_band["ask_iv_pct"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip"
+                ))
+                fig_sc.add_trace(go.Scatter(
+                    x=valid_band["strike"],
+                    y=valid_band["bid_iv_pct"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fill="tonexty",
+                    fillcolor="rgba(100, 181, 246, 0.2)",
+                    name="Market Volatility Band (Bid-Ask IV)"
+                ))
+
+            fig_sc.add_trace(go.Scatter(
+                x=[sc_strike],
+                y=[custom_iv_pct],
+                mode="markers",
+                marker=dict(size=14, color="#FFEA00", symbol="star", line=dict(width=2, color="black")),
+                name=f"Custom IV ({custom_iv_pct:.2f}%)"
+            ))
+
+            if not np.isnan(counter_iv_pct):
+                fig_sc.add_trace(go.Scatter(
+                    x=[sc_strike],
+                    y=[counter_iv_pct],
+                    mode="markers",
+                    marker=dict(size=12, color="#FF1744", symbol="x", line=dict(width=2, color="white")),
+                    name=f"Theoretical Countering IV ({counter_iv_pct:.2f}%)"
+                ))
+
+            fig_sc.update_layout(
+                title=f"Scenario Analysis: {sc_option_type} @ ${sc_strike:.2f} Strike",
+                xaxis_title="Strike ($)",
+                yaxis_title="Implied Volatility (%)",
+                template="plotly_dark",
+                paper_bgcolor="#0D1117",
+                plot_bgcolor="#0D1117",
+                height=500,
+                legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)")
+            )
+            st.plotly_chart(fig_sc, use_container_width=True)
+
+            st.markdown("### Scenario Metrics")
+            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+            with m_col1:
+                st.metric("Market Bid IV", f"{selected_band['bid_iv_pct']:.2f}%" if not np.isnan(selected_band['bid_iv_pct']) else "N/A")
+            with m_col2:
+                delta_val = custom_iv_pct - default_iv
+                st.metric("Custom Input IV", f"{custom_iv_pct:.2f}%", delta=f"{delta_val:.2f}% vs Mid", delta_color="inverse" if delta_val > 0 else "normal")
+            with m_col3:
+                st.metric("Market Ask IV", f"{selected_band['ask_iv_pct']:.2f}%" if not np.isnan(selected_band['ask_iv_pct']) else "N/A")
+            with m_col4:
+                if not np.isnan(counter_iv_pct):
+                    pc_diff = custom_iv_pct - counter_iv_pct
+                    st.metric("Countering IV (PC Parity)", f"{counter_iv_pct:.2f}%", delta=f"{pc_diff:.2f}% Diff", delta_color="off")
+                else:
+                    st.metric("Countering IV (PC Parity)", "N/A")
 
 
 if __name__ == "__main__":

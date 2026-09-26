@@ -336,3 +336,123 @@ def calculate_chain_implied_volatility(
     res_clean.reset_index(drop=True, inplace=True)
 
     return res_clean
+
+
+@st.cache_data(show_spinner=False)
+def calculate_bid_ask_iv_chain(
+    df: pd.DataFrame,
+    S: float,
+    T: float,
+    r: float,
+    option_type: OptionType = "call",
+    tol: float = 1e-6,
+    max_iter: int = 100,
+) -> pd.DataFrame:
+    """Calculate implied volatility for the bid and ask independently across an options chain DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Cleaned options DataFrame containing 'strike', 'bid', and 'ask' columns.
+    S : float
+        Current spot price of the underlying asset.
+    T : float
+        Time to expiration in years.
+    r : float
+        Risk-free interest rate.
+    option_type : Literal['call', 'put']
+        Option type.
+    tol : float, default 1e-6
+        Convergence tolerance for solver.
+    max_iter : int, default 100
+        Maximum iterations for solver.
+
+    Returns
+    -------
+    pd.DataFrame
+        Enriched DataFrame with 'bid_iv', 'ask_iv', 'bid_iv_pct', and 'ask_iv_pct'.
+    """
+    if df.empty or "strike" not in df.columns or "bid" not in df.columns or "ask" not in df.columns:
+        return df.copy()
+
+    res = df.copy()
+    bid_ivs = []
+    ask_ivs = []
+
+    for _, row in res.iterrows():
+        k = float(row["strike"])
+        bid = float(row["bid"])
+        ask = float(row["ask"])
+        
+        b_iv = implied_volatility(bid, S, k, T, r, option_type, tol, max_iter) if bid > 0 else np.nan
+        a_iv = implied_volatility(ask, S, k, T, r, option_type, tol, max_iter) if ask > 0 else np.nan
+        
+        bid_ivs.append(b_iv)
+        ask_ivs.append(a_iv)
+
+    res["bid_iv"] = bid_ivs
+    res["ask_iv"] = ask_ivs
+    res["bid_iv_pct"] = res["bid_iv"] * 100.0
+    res["ask_iv_pct"] = res["ask_iv"] * 100.0
+
+    return res
+
+
+def calculate_countering_iv(
+    price: float,
+    S: float,
+    K: float,
+    T: float,
+    r_custom: float,
+    original_option_type: OptionType,
+) -> float:
+    """Calculate the theoretical countering IV based on standard Put-Call parity.
+    
+    Uses the user-supplied custom risk-free rate to find the theoretical price of the
+    countering option, then reverse-engineers its implied volatility.
+
+    Parameters
+    ----------
+    price : float
+        Observed market price of the original option.
+    S : float
+        Current spot price.
+    K : float
+        Strike price.
+    T : float
+        Time to expiration in years.
+    r_custom : float
+        Custom user-supplied risk-free rate.
+    original_option_type : Literal['call', 'put']
+        The type of the original option.
+
+    Returns
+    -------
+    float
+        The theoretical countering implied volatility.
+    """
+    discounted_strike = K * np.exp(-r_custom * T)
+    
+    if original_option_type == "call":
+        # P = C - S + K * e^{-rT}
+        countering_price = price - S + discounted_strike
+        counter_type = "put"
+    elif original_option_type == "put":
+        # C = P + S - K * e^{-rT}
+        countering_price = price + S - discounted_strike
+        counter_type = "call"
+    else:
+        return np.nan
+
+    if countering_price <= 0.0:
+        return np.nan
+
+    return implied_volatility(
+        price=countering_price,
+        S=S,
+        K=K,
+        T=T,
+        r=r_custom,
+        option_type=counter_type
+    )
+
