@@ -1,0 +1,335 @@
+"""Data Ingestion and Cleaning Pipeline for Options Chains.
+
+Ingests intraday market quotes via yfinance, sanitises raw order book noise,
+applies microstructure filters (volume, bid-ask spreads, arbitrage bounds),
+and computes contract metrics (mid-prices, moneyness, time-to-expiration).
+"""
+
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import pandas_datareader.data as web
+import streamlit as st
+import yfinance as yf
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yield_curve() -> Tuple[np.ndarray, np.ndarray]:
+    """Fetch latest US Treasury yield curve from FRED.
+
+    Cached for 1 hour to prevent excessive API calls. Falls back to a flat
+    rate curve if the network request fails.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        (tenors_in_years, rates_as_decimals)
+    """
+    tickers = ['DGS1MO', 'DGS3MO', 'DGS6MO', 'DGS1', 'DGS2', 'DGS3', 'DGS5', 'DGS7', 'DGS10', 'DGS20', 'DGS30']
+    tenors = np.array([1/12, 3/12, 6/12, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 20.0, 30.0])
+    
+    try:
+        end_date = datetime.today()
+        # Look back 30 days to guarantee at least one valid trading day is retrieved
+        start_date = end_date - timedelta(days=30)
+        df = web.DataReader(tickers, 'fred', start_date, end_date)
+        
+        # Forward fill missing values (e.g. holidays) and grab the latest row
+        df = df.ffill().dropna()
+        if df.empty:
+            raise ValueError("FRED returned empty yield curve data.")
+            
+        # Convert percentages to decimals (e.g., 4.5% -> 0.045)
+        latest_rates = df.iloc[-1].values / 100.0
+        return tenors, latest_rates
+        
+    except Exception as exc:
+        # Fallback to a flat 4.5% risk-free rate if API fails
+        print(f"Warning: Failed to fetch FRED yield curve ({exc}). Falling back to flat 4.5% rate.")
+        return tenors, np.full_like(tenors, 0.045)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ticker_metadata(ticker_symbol: str) -> Dict[str, Any]:
+    """Fetch underlying spot price and available expiration dates for a ticker.
+
+    Cached for 300 seconds to preserve UI responsiveness while tracking intraday updates.
+
+    Parameters
+    ----------
+    ticker_symbol : str
+        Equity ticker symbol (e.g., 'SPY', 'AAPL').
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary containing:
+        - 'ticker': yf.Ticker object
+        - 'spot_price': float
+        - 'expirations': List[str] (sorted list of available expiry dates 'YYYY-MM-DD')
+        - 'currency': str
+
+    Raises
+    ------
+    ValueError
+        If the ticker symbol is invalid or contains no options data.
+    """
+    clean_symbol = ticker_symbol.strip().upper()
+    if not clean_symbol:
+        raise ValueError("Ticker symbol cannot be empty.")
+
+    try:
+        ticker = yf.Ticker(clean_symbol)
+        expirations: Tuple[str, ...] = ticker.options
+    except Exception as exc:
+        raise ValueError(f"Failed to query options for ticker '{clean_symbol}': {exc}") from exc
+
+    if not expirations:
+        raise ValueError(
+            f"No options chain data available for '{clean_symbol}'. "
+            "Verify the ticker symbol or market trading status."
+        )
+
+    # Robust spot price resolution across fast_info, regularMarketPrice, and 1-day history
+    spot_price: Optional[float] = None
+
+    # Priority 1: fast_info last_price or previous_close
+    try:
+        if hasattr(ticker, "fast_info"):
+            price = getattr(ticker.fast_info, "last_price", None)
+            if price is None or np.isnan(price) or price <= 0:
+                price = getattr(ticker.fast_info, "previous_close", None)
+            if price is not None and not np.isnan(price) and price > 0:
+                spot_price = float(price)
+    except Exception:
+        pass
+
+    # Priority 2: info regularMarketPrice
+    if spot_price is None:
+        try:
+            info = ticker.info
+            price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
+            if price is not None and not np.isnan(price) and price > 0:
+                spot_price = float(price)
+        except Exception:
+            pass
+
+    # Priority 3: 1-day intraday/daily history
+    if spot_price is None:
+        try:
+            hist = ticker.history(period="5d")
+            if not hist.empty and "Close" in hist.columns:
+                spot_price = float(hist["Close"].dropna().iloc[-1])
+        except Exception:
+            pass
+
+    if spot_price is None or spot_price <= 0:
+        raise ValueError(f"Unable to retrieve a valid spot price for '{clean_symbol}'.")
+
+    # Currency extraction
+    currency = "USD"
+    try:
+        if hasattr(ticker, "fast_info") and hasattr(ticker.fast_info, "currency"):
+            currency = ticker.fast_info.currency or "USD"
+    except Exception:
+        pass
+
+    # Dividend Yield extraction
+    div_yield = 0.0
+    try:
+        info = ticker.info
+        
+        # Priority 1: trailingAnnualDividendYield (usually correctly formatted as a decimal)
+        dy = info.get("trailingAnnualDividendYield")
+        
+        # Priority 2: 'yield' (ETF specific, usually decimal)
+        if dy is None or np.isnan(dy):
+            dy = info.get("yield")
+            
+        # Priority 3: 'dividendYield' (Yahoo returns this as a percentage e.g. 0.98 for 0.98%)
+        if dy is None or np.isnan(dy):
+            dy_raw = info.get("dividendYield")
+            if dy_raw is not None and not np.isnan(dy_raw):
+                dy = float(dy_raw) / 100.0
+                
+        if dy is not None and not np.isnan(dy):
+            div_yield = max(0.0, float(dy))
+    except Exception:
+        pass
+
+    return {
+        "ticker_symbol": clean_symbol,
+        "spot_price": spot_price,
+        "expirations": list(expirations),
+        "currency": currency,
+        "dividend_yield": div_yield,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_option_chain_raw(ticker_symbol: str, expiry_date: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Retrieve raw call and put options chains for a specified expiration.
+
+    Parameters
+    ----------
+    ticker_symbol : str
+        Ticker symbol.
+    expiry_date : str
+        Expiration date string in 'YYYY-MM-DD' format.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        Tuple containing raw (calls_df, puts_df).
+
+    Raises
+    ------
+    ValueError
+        If the option chain cannot be retrieved.
+    """
+    clean_symbol = ticker_symbol.strip().upper()
+    try:
+        ticker = yf.Ticker(clean_symbol)
+        chain = ticker.option_chain(expiry_date)
+        calls = chain.calls.copy()
+        puts = chain.puts.copy()
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to fetch option chain for {clean_symbol} on {expiry_date}: {exc}"
+        ) from exc
+
+    return calls, puts
+
+
+def calculate_time_to_expiration(expiry_date_str: str) -> Tuple[float, int]:
+    """Calculate annualized time to expiration (T) and calendar days to expiration (DTE).
+
+    Assumes market expiration at 16:00 (4:00 PM) Eastern Time.
+    Enforces a strict positive floor for 0DTE contracts to avoid division by zero.
+
+    Parameters
+    ----------
+    expiry_date_str : str
+        Expiration date in 'YYYY-MM-DD' format.
+
+    Returns
+    -------
+    Tuple[float, int]
+        (T_annualized, days_to_expiration).
+    """
+    expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
+    today = date.today()
+    dte = (expiry_date - today).days
+
+    if dte <= 0:
+        # 0DTE option: allocate remaining fraction of trading day (~4 hours or 0.5/365.0 minimum)
+        T = max(1.0 / (365.0 * 24.0), 0.5 / 365.0)
+        return float(T), 0
+
+    T = dte / 365.0
+    return float(T), int(dte)
+
+
+def clean_options_data(
+    raw_df: pd.DataFrame,
+    spot_price: float,
+    T: float,
+    r: float,
+    q: float,
+    option_type: str = "call",
+    min_volume: int = 1,
+    min_bid: float = 0.05,
+    max_spread_pct: float = 0.60,
+    min_open_interest: int = 0,
+) -> pd.DataFrame:
+    """Filter out noisy, illiquid, or arbitrage-violating option quotes.
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        Raw calls or puts DataFrame from yfinance.
+    spot_price : float
+        Current underlying spot price.
+    T : float
+        Time to expiration in years.
+    r : float
+        Risk-free rate.
+    q : float
+        Dividend yield.
+    option_type : str, default 'call'
+        'call' or 'put'.
+    min_volume : int, default 1
+        Filter strikes with volume strictly below this threshold.
+    min_bid : float, default 0.05
+        Filter out strikes with zero or negligible bid prices (market maker absence).
+    max_spread_pct : float, default 0.60
+        Filter out strikes with bid-ask spreads exceeding this fraction of mid-price.
+    min_open_interest : int, default 0
+        Filter contracts with open interest below threshold.
+
+    Returns
+    -------
+    pd.DataFrame
+        Sanitized, validated DataFrame ready for quantitative model inversion.
+    """
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    df = raw_df.copy()
+
+    # Fill NaN values for numerical columns
+    df["bid"] = pd.to_numeric(df.get("bid", 0.0), errors="coerce").fillna(0.0)
+    df["ask"] = pd.to_numeric(df.get("ask", 0.0), errors="coerce").fillna(0.0)
+    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+    df["openInterest"] = pd.to_numeric(df.get("openInterest", 0), errors="coerce").fillna(0)
+    df["strike"] = pd.to_numeric(df.get("strike", 0.0), errors="coerce").fillna(0.0)
+
+    # 1. Calculate mid-price and spread metrics
+    df["mid_price"] = (df["bid"] + df["ask"]) / 2.0
+    df["bid_ask_spread"] = df["ask"] - df["bid"]
+
+    # Avoid division by zero when calculating spread percentage
+    safe_mid = np.where(df["mid_price"] > 0, df["mid_price"], np.nan)
+    df["spread_pct"] = df["bid_ask_spread"] / safe_mid
+
+    # Fill NaN volume and openInterest with 0 (market maker quotes are valid even with 0 daily trades)
+    df["volume"] = df["volume"].fillna(0)
+    df["openInterest"] = df.get("openInterest", df["volume"]).fillna(0)
+
+    # 2. Liquidity & Order Book Filters
+    mask_liquidity = (
+        (df["bid"] >= min_bid)
+        & (df["ask"] > df["bid"])
+        & (df["volume"] >= min_volume)
+        & (df["openInterest"] >= min_open_interest)
+    )
+
+    # 3. Spread Noise Filter
+    mask_spread = (df["spread_pct"] <= max_spread_pct) & (df["spread_pct"] >= 0.0)
+
+    # 4. No-Arbitrage Boundary Sanity Filter
+    # An option mid price should not trade below its theoretical intrinsic bounds.
+    # We use the Black-Scholes-Merton (BSM) adjusted bounds accommodating the dividend yield.
+    S_adj = spot_price * np.exp(-q * T)
+    K_adj = df["strike"] * np.exp(-r * T)
+    
+    if option_type == "call":
+        intrinsic = np.maximum(0.0, S_adj - K_adj)
+        mask_intrinsic = (df["mid_price"] > intrinsic) & (df["mid_price"] < S_adj)
+    else:
+        intrinsic = np.maximum(0.0, K_adj - S_adj)
+        mask_intrinsic = (df["mid_price"] > intrinsic) & (df["mid_price"] < K_adj)
+
+    combined_mask = mask_liquidity & mask_spread & mask_intrinsic
+    clean_df = df[combined_mask].copy()
+
+    # Drop duplicate strikes if any, keeping highest volume entry
+    clean_df.sort_values(by=["strike", "volume"], ascending=[True, False], inplace=True)
+    clean_df.drop_duplicates(subset=["strike"], keep="first", inplace=True)
+    clean_df.reset_index(drop=True, inplace=True)
+
+    # Compute moneyness
+    clean_df["moneyness"] = clean_df["strike"] / spot_price
+
+    return clean_df

@@ -24,8 +24,8 @@ from options_math import (
     calculate_chain_implied_volatility,
     build_yield_curve_spline,
     get_risk_free_rate,
-    calculate_bid_ask_iv_chain,
-    calculate_countering_iv,
+    ssvi_total_variance,
+    fit_ssvi_slice,
 )
 
 # ---------------------------------------------------------
@@ -33,7 +33,7 @@ from options_math import (
 # ---------------------------------------------------------
 st.set_page_config(
     page_title="Options Volatility Smile Engine",
-    page_icon="📈",
+    page_icon="??",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -86,67 +86,92 @@ def build_volatility_smile_chart(
     x_axis_mode: str = "Strike Price ($)",
     show_calls: bool = True,
     show_puts: bool = True,
+    stitch_otm: bool = True,
     overlay_yahoo_iv: bool = False,
+    show_iv_spread: bool = True,
     strike_min: Optional[float] = None,
     strike_max: Optional[float] = None,
+    ssvi_params: Optional[dict] = None,
+    T: float = 1.0,
+    r: float = 0.0,
+    q: float = 0.0,
 ) -> go.Figure:
-    """Construct an interactive Plotly visualization of the Volatility Smile.
-
-    Parameters
-    ----------
-    calls_df : pd.DataFrame
-        DataFrame of processed Call contracts with solved IV.
-    puts_df : pd.DataFrame
-        DataFrame of processed Put contracts with solved IV.
-    spot_price : float
-        Current underlying asset spot price.
-    x_axis_mode : str, default 'Strike Price ($)'
-        'Strike Price ($)', 'Moneyness (K / S)', or 'Log-Moneyness ln(K / S)'.
-    show_calls : bool, default True
-        Whether to display Call IV trace.
-    show_puts : bool, default True
-        Whether to display Put IV trace.
-    overlay_yahoo_iv : bool, default False
-        Whether to overlay Yahoo Finance's uncleaned raw IV.
-    strike_min : Optional[float]
-        Lower strike cutoff for zoom.
-    strike_max : Optional[float]
-        Upper strike cutoff for zoom.
-
-    Returns
-    -------
-    go.Figure
-        Plotly Figure object displaying the volatility smile.
-    """
+    """Construct an interactive Plotly visualization of the Volatility Smile."""
     fig = go.Figure()
 
+    # Calculate Forward price for rigorous moneyness/stitching
+    F = spot_price * np.exp((r - q) * T)
+
     def get_x_values(df: pd.DataFrame) -> Tuple[np.ndarray, str]:
-        if x_axis_mode == "Moneyness (K / S)":
-            return df["strike"].values / spot_price, "Moneyness (K/S)"
-        elif x_axis_mode == "Log-Moneyness ln(K / S)":
-            return np.log(df["strike"].values / spot_price), "Log-Moneyness ln(K/S)"
+        if x_axis_mode == "Forward Moneyness (K / F)":
+            return df["strike"].values / F, "Forward Moneyness (K / F)"
+        elif x_axis_mode == "Log-Forward Moneyness ln(K / F)":
+            return np.log(df["strike"].values / F), "Log-Forward Moneyness ln(K / F)"
         return df["strike"].values, "Strike Price ($)"
 
-    # Filter by strike range if specified
+    # Copy and filter dataframes
     c_df = calls_df.copy()
     p_df = puts_df.copy()
-    if strike_min is not None:
-        c_df = c_df[c_df["strike"] >= strike_min]
-        p_df = p_df[p_df["strike"] >= strike_min]
-    if strike_max is not None:
-        c_df = c_df[c_df["strike"] <= strike_max]
-        p_df = p_df[p_df["strike"] <= strike_max]
+    
+    if stitch_otm:
+        # Discard ITM options to avoid American early-exercise premium distortion
+        # Stitch using forward price (F) rather than spot price (S)
+        if not c_df.empty:
+            c_df = c_df[c_df["strike"] >= F]
+        if not p_df.empty:
+            p_df = p_df[p_df["strike"] < F]
 
-    # Reference spot line coordinate on x-axis
-    if x_axis_mode == "Moneyness (K / S)":
-        spot_x = 1.0
-        x_label = "Moneyness (K / S)"
-    elif x_axis_mode == "Log-Moneyness ln(K / S)":
-        spot_x = 0.0
-        x_label = "Log-Moneyness ln(K / S)"
+    if strike_min is not None:
+        if not c_df.empty: c_df = c_df[c_df["strike"] >= strike_min]
+        if not p_df.empty: p_df = p_df[p_df["strike"] >= strike_min]
+    if strike_max is not None:
+        if not c_df.empty: c_df = c_df[c_df["strike"] <= strike_max]
+        if not p_df.empty: p_df = p_df[p_df["strike"] <= strike_max]
+
+    # Reference Forward line coordinate on x-axis
+    if x_axis_mode == "Forward Moneyness (K / F)":
+        fwd_x = 1.0
+        x_label = "Forward Moneyness (K / F)"
+    elif x_axis_mode == "Log-Forward Moneyness ln(K / F)":
+        fwd_x = 0.0
+        x_label = "Log-Forward Moneyness ln(K / F)"
     else:
-        spot_x = spot_price
+        fwd_x = F
         x_label = "Strike Price ($)"
+
+    # Plot SSVI Arbitrage-Free Surface Curve
+    if ssvi_params and ssvi_params.get("theta") is not None:
+        F = spot_price * np.exp((r - q) * T)
+        
+        all_strikes = []
+        if not c_df.empty: all_strikes.extend(c_df["strike"].tolist())
+        if not p_df.empty: all_strikes.extend(p_df["strike"].tolist())
+        
+        if all_strikes:
+            k_min = np.log(min(all_strikes) / F)
+            k_max = np.log(max(all_strikes) / F)
+            k_dense = np.linspace(k_min, k_max, 300)
+            
+            w_dense = ssvi_total_variance(k_dense, ssvi_params["theta"], ssvi_params["rho"], ssvi_params["phi"])
+            iv_dense = np.sqrt(np.maximum(w_dense / T, 1e-8)) * 100.0
+            
+            strike_dense = F * np.exp(k_dense)
+            
+            if x_axis_mode == "Forward Moneyness (K / F)":
+                x_dense = strike_dense / F
+            elif x_axis_mode == "Log-Forward Moneyness ln(K / F)":
+                x_dense = np.log(strike_dense / F)
+            else:
+                x_dense = strike_dense
+                
+            fig.add_trace(go.Scatter(
+                x=x_dense, 
+                y=iv_dense,
+                mode="lines",
+                name="SSVI Arbitrage-Free Fit",
+                line=dict(color="#FF00FF", width=3, dash="solid"),
+                hoverinfo="skip"
+            ))
 
     # Plot Calls
     if show_calls and not c_df.empty:
@@ -155,9 +180,9 @@ def build_volatility_smile_chart(
             go.Scatter(
                 x=x_c,
                 y=c_df["iv_pct"],
-                mode="lines+markers",
-                name="Call IV (Reverse-Engineered)",
-                line=dict(color="#00D4FF", width=2.5, shape="spline", smoothing=0.8),
+                mode="markers" if ssvi_params else "lines+markers",
+                name="Call IV (Mid Price)",
+                line=dict(color="#00D4FF", width=1.5, shape="spline", smoothing=0.8),
                 marker=dict(size=6, color="#00D4FF", symbol="circle"),
                 customdata=np.stack(
                     (
@@ -185,6 +210,28 @@ def build_volatility_smile_chart(
             )
         )
 
+        if show_iv_spread and "bid_iv_pct" in c_df.columns and "ask_iv_pct" in c_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=x_c, y=c_df["ask_iv_pct"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip"
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x_c, y=c_df["bid_iv_pct"],
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(41, 182, 246, 0.15)",
+                    line=dict(width=0),
+                    name="Call IV Bid/Ask Spread",
+                    hoverinfo="skip"
+                )
+            )
+
         if overlay_yahoo_iv and "impliedVolatility" in c_df.columns:
             fig.add_trace(
                 go.Scatter(
@@ -192,21 +239,19 @@ def build_volatility_smile_chart(
                     y=c_df["impliedVolatility"] * 100.0,
                     mode="markers",
                     name="Call Yahoo Raw IV",
-                    marker=dict(size=4, color="#64B5F6", symbol="x", opacity=0.6),
+                    marker=dict(size=4, color="#81D4FA", symbol="x", opacity=0.6),
                     hoverinfo="skip",
                 )
             )
-
-    # Plot Puts
     if show_puts and not p_df.empty:
         x_p, _ = get_x_values(p_df)
         fig.add_trace(
             go.Scatter(
                 x=x_p,
                 y=p_df["iv_pct"],
-                mode="lines+markers",
-                name="Put IV (Reverse-Engineered)",
-                line=dict(color="#FF7043", width=2.5, shape="spline", smoothing=0.8),
+                mode="markers" if ssvi_params else "lines+markers",
+                name="Put IV (Mid Price)",
+                line=dict(color="#FF7043", width=1.5, shape="spline", smoothing=0.8),
                 marker=dict(size=6, color="#FF7043", symbol="diamond"),
                 customdata=np.stack(
                     (
@@ -234,6 +279,28 @@ def build_volatility_smile_chart(
             )
         )
 
+        if show_iv_spread and "bid_iv_pct" in p_df.columns and "ask_iv_pct" in p_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=x_p, y=p_df["ask_iv_pct"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip"
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x_p, y=p_df["bid_iv_pct"],
+                    mode="lines",
+                    fill="tonexty",
+                    fillcolor="rgba(255, 112, 67, 0.15)",
+                    line=dict(width=0),
+                    name="Put IV Bid/Ask Spread",
+                    hoverinfo="skip"
+                )
+            )
+
         if overlay_yahoo_iv and "impliedVolatility" in p_df.columns:
             fig.add_trace(
                 go.Scatter(
@@ -245,19 +312,27 @@ def build_volatility_smile_chart(
                     hoverinfo="skip",
                 )
             )
-
-    # Spot Price vertical reference marker
+    # Forward Price vertical reference marker
     fig.add_vline(
-        x=spot_x,
+        x=fwd_x,
         line_width=1.8,
         line_dash="dash",
         line_color="#E0E0E0",
-        annotation_text=f"Spot: ${spot_price:.2f}" if x_axis_mode == "Strike Price ($)" else "ATM (Spot)",
+        annotation_text=f"Forward: " if x_axis_mode == "Strike Price ($)" else "ATM (Forward)",
         annotation_position="top right",
         annotation_font=dict(color="#E0E0E0", size=11),
     )
 
     # Polished layout
+    x_range = None
+    if strike_min is not None and strike_max is not None:
+        if x_axis_mode == "Forward Moneyness (K / F)":
+            x_range = [strike_min / F, strike_max / F]
+        elif x_axis_mode == "Log-Forward Moneyness ln(K / F)":
+            x_range = [float(np.log(strike_min / F)), float(np.log(strike_max / F))]
+        else:
+            x_range = [strike_min, strike_max]
+
     fig.update_layout(
         title=dict(
             text=f"Implied Volatility Smile ({x_label})",
@@ -271,6 +346,7 @@ def build_volatility_smile_chart(
             gridcolor="#21262D",
             zeroline=False,
             color="#8B949E",
+            range=x_range,
         ),
         yaxis=dict(
             title=dict(text="Implied Volatility (%)", font=dict(color="#C9D1D9", size=13)),
@@ -302,13 +378,90 @@ def build_volatility_smile_chart(
     return fig
 
 
+def render_methodology_page():
+    st.title("Quantitative Methodology & Architecture")
+    st.markdown("This whitepaper details the mathematical and quantitative pipeline powering the options volatility engine.")
+    
+    st.header("1. Data Sanitisation & No-Arbitrage Bounds")
+    st.markdown(r'''
+Before root-finding, raw option quotes are sanitised to prevent solver divergence. We compute the mid-price as $P_{mid} = \frac{P_{bid} + P_{ask}}{2}$. 
+Any quotes violating fundamental no-arbitrage bounds are discarded:
+- **Calls:** $\max(0, S - K e^{-rT}) \leq C_{mkt} \leq S$
+- **Puts:** $\max(0, K e^{-rT} - S) \leq P_{mkt} \leq K e^{-rT}$
+    ''')
+    
+    st.header("2. Yield Curve Term Structure (Cubic Spline)")
+    st.markdown(r'''
+Standard option calculators use a static, hardcoded risk-free rate. This introduces maturity mismatch errors. 
+Our engine dynamically interpolates the **US Treasury Yield Curve** using a **Natural Cubic Spline**:
+1. We query live Constant Maturity Treasury rates (1M, 3M, 6M, 1Y, 2Y, etc.) from the Federal Reserve (FRED).
+2. We fit a twice-differentiable piecewise polynomial $S(t)$ across the tenors.
+3. For an option with Time to Expiration $T$, we extract the exact interpolated rate $r(T) = S(T)$ to compute the precise continuous discount factor $e^{-rT}$.
+    ''')
+    
+    st.header("3. Forward Moneyness ($k$)")
+    st.markdown(r'''
+To rigorously model options and strip out the impact of risk-free drift and dividend decay, we convert the Spot Price ($S$) to the **Forward Price** ($F$):
+$$ F = S e^{(r-q)T} $$
+We stitch Out-of-the-Money (OTM) calls and puts precisely at $K = F$, and parameterise the volatility smile using log-forward moneyness ($k$):
+$$ k = \ln\left(\frac{K}{F}\right) $$
+    ''')
+
+    st.header("4. Implied Volatility Inversion")
+    st.markdown(r'''
+We extract the Black-Scholes implied volatility $\sigma$ using a hybrid **Newton-Raphson / Brentq** root-finding algorithm.
+The Newton step relies on the option's Vega ($\mathcal{V}$):
+$$ \sigma_{n+1} = \sigma_n - \frac{C_{BS}(\sigma_n) - C_{mkt}}{\mathcal{V}(\sigma_n)} $$
+If Vega vanishes (deep OTM options) or the Newton step escapes the search bounds, the algorithm automatically falls back to Brent's method for guaranteed convergence.
+    ''')
+
+    st.header("5. SSVI Parameterisation (Gatheral & Jacquier 2014)")
+    st.markdown(r'''
+We fit the **Surface Stochastic Volatility Inspired (SSVI)** model to the extracted volatility smile. The model parameterises the total implied variance $w(k) = \sigma^2(k) T$ as:
+$$ w(k) = \frac{\theta}{2} \left[ 1 + \rho \phi k + \sqrt{(\phi k + \rho)^2 + (1 - \rho^2)} \right] $$
+Where:
+- $\theta$: ATM total variance ($w(0)$).
+- $\rho$: Correlation parameter governing the **skew** ($-1 < \rho < 1$).
+- $\phi$: Curvature parameter governing the **smile** ($\phi > 0$).
+    ''')
+
+    st.header("6. Arbitrage Diagnostics")
+    st.markdown(r'''
+Unlike generic polynomial splines, the SSVI formulation is analytically proven to prevent arbitrage. Our pipeline enforces Durrleman's **Butterfly Arbitrage Condition** on the fitted slice:
+$$ \theta \phi (1 + |\rho|) \leq 4 $$
+*(Note: Complete Calendar Arbitrage absence requires $\partial w / \partial T \geq 0$, which necessitates a multi-expiry surface calibration rather than a single slice).*
+    ''')
+
+    st.header("7. Weighted Calibration (Microstructure Noise)")
+    st.markdown(r'''
+Option markets contain illiquid quotes with massive Bid/Ask spreads deep in the wings. An unweighted Ordinary Least Squares (OLS) fit allows these noisy quotes to artificially distort the SSVI curvature ($\phi$). 
+To immunize the calibration, we utilize a **Spread-Weighted Objective Function**, where the weight $W_i$ of each observation is inversely proportional to its spread variance:
+$$ W_i \propto \frac{1}{(\text{Spread}_i)^2} $$
+$$ \min_{\theta, \rho, \phi} \sum_{i} W_i \left(w_i - w_{SSVI}(k_i)\right)^2 $$
+    ''')
+
 def main() -> None:
     """Main application loop and UI orchestration."""
     # ---------------------------------------------------------
     # Sidebar: Asset, Expiration & Quantitative Controls
     # ---------------------------------------------------------
     with st.sidebar:
-        st.title("⚙️ Engine Controls")
+        app_mode = st.radio(
+            "Navigation",
+            ["Analytics Dashboard", "Quantitative Methodology"],
+            label_visibility="collapsed"
+        )
+        st.divider()
+        
+        if app_mode == "Quantitative Methodology":
+            st.info("View the full quantitative architecture and mathematical definitions used to power the Option Engine.")
+
+    if app_mode == "Quantitative Methodology":
+        render_methodology_page()
+        return
+
+    with st.sidebar:
+        st.title("Engine Controls")
         st.caption("Quantitative Options Parameters")
 
         # 1. Ticker Selection
@@ -332,9 +485,10 @@ def main() -> None:
             st.stop()
 
         spot_price = float(meta["spot_price"])
+        dividend_yield = float(meta.get("dividend_yield", 0.0))
         expirations: List[str] = meta["expirations"]
 
-        st.success(f"**{ticker_input}** Spot: **${spot_price:,.2f} {meta['currency']}**")
+        st.success(f"**{ticker_input}** Spot: **${spot_price:,.2f} {meta['currency']}** | Div Yield: **{dividend_yield * 100:.2f}%**")
 
         # 2. Expiration Selection
         st.subheader("2. Expiration Date")
@@ -375,10 +529,16 @@ def main() -> None:
             yield_spline = build_yield_curve_spline(yc_tenors, yc_rates)
             risk_free_rate = get_risk_free_rate(yield_spline, T)
             
-            st.metric(
-                "Interpolated Risk-Free Rate",
+            mac1, mac2 = st.columns(2)
+            mac1.metric(
+                "Risk-Free Rate (r)",
                 f"{risk_free_rate * 100:.3f}%",
                 help=f"Dynamically interpolated from US Treasury spline for T={T:.3f} years."
+            )
+            mac2.metric(
+                "Dividend Yield (q)",
+                f"{dividend_yield * 100:.2f}%",
+                help="Trailing annual continuous dividend yield."
             )
         except Exception as e:
             st.error("Yield Curve API error. Using fallback 4.5%.")
@@ -386,12 +546,12 @@ def main() -> None:
             st.metric("Fallback Risk-Free Rate", "4.500%")
 
         # 4. Data Cleaning & Microstructure Filters
-        with st.expander("🧹 Order Book Cleaning Filters", expanded=False):
+        with st.expander("Order Book Cleaning Filters", expanded=False):
             min_volume = st.number_input(
                 "Min Volume",
                 min_value=0,
                 max_value=10000,
-                value=1,
+                value=0,
                 help="Eliminates zero-volume stale or ghost contracts.",
             )
             min_bid = st.number_input(
@@ -419,7 +579,7 @@ def main() -> None:
             )
 
         # 5. Solver Settings
-        with st.expander("🔬 Black-Scholes Solver Settings", expanded=False):
+        with st.expander("Black-Scholes Solver Settings", expanded=False):
             solver_tol = st.select_slider(
                 "Price Convergence Tolerance",
                 options=[1e-4, 1e-5, 1e-6, 1e-7],
@@ -430,16 +590,16 @@ def main() -> None:
 
         # 6. Cache Invalidation
         st.divider()
-        if st.button("🔄 Refresh Data / Clear Cache", use_container_width=True):
+        if st.button("Refresh Data / Clear Cache", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
 
     # ---------------------------------------------------------
     # Main Header & Dashboard Context
     # ---------------------------------------------------------
-    st.title("📈 Options Volatility Smile Engine")
+    st.title("Options Volatility Smile Engine")
     st.markdown(
-        "Production-grade Quantitative MVP: Ingests intraday options chains, sanitizes order book noise, "
+        "Production-grade Quantitative MVP: Ingests intraday options chains, sanitises order book noise, "
         "reverse-engineers the Black-Scholes pricing model to find Implied Volatility (IV), and maps the volatility smile."
     )
 
@@ -460,6 +620,9 @@ def main() -> None:
     calls_clean = clean_options_data(
         calls_raw,
         spot_price=spot_price,
+        T=T,
+        r=risk_free_rate,
+        q=dividend_yield,
         option_type="call",
         min_volume=int(min_volume),
         min_bid=float(min_bid),
@@ -470,6 +633,9 @@ def main() -> None:
     puts_clean = clean_options_data(
         puts_raw,
         spot_price=spot_price,
+        T=T,
+        r=risk_free_rate,
+        q=dividend_yield,
         option_type="put",
         min_volume=int(min_volume),
         min_bid=float(min_bid),
@@ -480,12 +646,13 @@ def main() -> None:
     # ---------------------------------------------------------
     # Numerical Root-Finding (Reverse-Engineer IV)
     # ---------------------------------------------------------
-    with st.spinner("Executing Black-Scholes IV numerical root-finding (Newton-Raphson + Brentq)..."):
+    with st.spinner("Executing BSM IV numerical root-finding (Newton-Raphson + Brentq)..."):
         calls_iv = calculate_chain_implied_volatility(
             calls_clean,
             S=spot_price,
             T=T,
             r=risk_free_rate,
+            q=dividend_yield,
             option_type="call",
             tol=solver_tol,
             max_iter=max_iterations,
@@ -495,6 +662,7 @@ def main() -> None:
             S=spot_price,
             T=T,
             r=risk_free_rate,
+            q=dividend_yield,
             option_type="put",
             tol=solver_tol,
             max_iter=max_iterations,
@@ -527,7 +695,7 @@ def main() -> None:
             <div class="metric-card">
                 <div class="metric-title">Underlying Spot</div>
                 <div class="metric-value">${spot_price:,.2f}</div>
-                <div class="metric-sub">{ticker_input} • {meta['currency']}</div>
+                <div class="metric-sub">{ticker_input} | {meta['currency']}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -545,12 +713,13 @@ def main() -> None:
         )
     with kpi3:
         atm_val_str = f"${atm_strike:.2f}" if atm_strike is not None else "N/A"
+        dist_str = f"Distance: {abs(atm_strike - spot_price):.2f} pts" if atm_strike is not None else "Distance: N/A"
         st.markdown(
             f"""
             <div class="metric-card">
                 <div class="metric-title">ATM Strike (K_ATM)</div>
                 <div class="metric-value">{atm_val_str}</div>
-                <div class="metric-sub">Distance: {abs(atm_strike - spot_price):.2f} pts</div>
+                <div class="metric-sub">{dist_str}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -586,14 +755,20 @@ def main() -> None:
     # ---------------------------------------------------------
     # Chart Control Bar & Interactive Plotly Volatility Smile
     # ---------------------------------------------------------
-    st.subheader("Volatility Smile Surface")
+    st.subheader("Implied Volatility Smile (Slice)")
 
-    c_ctrl1, c_ctrl2, c_ctrl3, c_ctrl4 = st.columns([1.5, 1.2, 1.2, 1.2])
+    c_ctrl1, c_ctrl2, c_ctrl3, c_ctrl4, c_ctrl5 = st.columns([1.5, 1.2, 1.2, 1.4, 1.2])
     with c_ctrl1:
         x_mode = st.radio(
-            "X-Axis Representation",
-            ["Strike Price ($)", "Moneyness (K / S)", "Log-Moneyness ln(K / S)"],
+            "X-Axis",
+            ["Strike Price ($)", "Forward Moneyness (K / F)", "Log-Forward Moneyness ln(K / F)"],
             horizontal=True,
+        )
+        calibration_weighting = st.selectbox(
+            "SSVI Fit Weighting",
+            options=["Unweighted (OLS)", "Spread-Weighted", "Vega-Weighted"],
+            index=1,
+            help="Weights for the SSVI calibration. Spread-Weighted reduces the influence of noisy, illiquid quotes."
         )
     with c_ctrl2:
         show_calls = st.checkbox("Show Calls", value=True)
@@ -602,9 +777,20 @@ def main() -> None:
         overlay_yahoo = st.checkbox(
             "Compare Yahoo Raw IV",
             value=False,
-            help="Displays Yahoo's raw IV values as markers to contrast noise and artifacts against reverse-engineered mid-price IV.",
+            help="Displays Yahoo's raw IV values as markers to contrast noise against reverse-engineered mid-price IV.",
+        )
+        show_iv_spread = st.checkbox(
+            "Show Bid/Ask IV Spread",
+            value=True,
+            help="Displays the IV bounds implied by the bid and ask quotes."
         )
     with c_ctrl4:
+        stitch_otm = st.checkbox(
+            "Stitch OTM Only",
+            value=True,
+            help="Eliminates 'American Premium' distortion by building the curve exclusively from OTM options."
+        )
+    with c_ctrl5:
         # Strike range filter slider
         if all_strikes:
             s_min_default = max(float(min(all_strikes)), spot_price * 0.75)
@@ -619,35 +805,91 @@ def main() -> None:
         else:
             strike_range = (None, None)
 
+    # SSVI Fitting Logic (Gatheral & Jacquier 2014)
+    ssvi_params = None
+    with st.spinner("Fitting Surface SVI (SSVI) Arbitrage-Free Model..."):
+        dfs_to_concat = []
+        if not calls_iv.empty: dfs_to_concat.append(calls_iv)
+        if not puts_iv.empty: dfs_to_concat.append(puts_iv)
+        
+        fit_df = pd.concat(dfs_to_concat) if dfs_to_concat else pd.DataFrame()
+        
+        F_val = spot_price * np.exp((risk_free_rate - dividend_yield) * T)
+
+        if stitch_otm and not fit_df.empty:
+            stitch_dfs = []
+            if not calls_iv.empty:
+                stitch_dfs.append(calls_iv[calls_iv["strike"] >= F_val])
+            if not puts_iv.empty:
+                stitch_dfs.append(puts_iv[puts_iv["strike"] < F_val])
+            fit_df = pd.concat(stitch_dfs) if stitch_dfs else pd.DataFrame()
+        
+        if not fit_df.empty and "implied_volatility" in fit_df.columns:
+            fit_df = fit_df.dropna(subset=["implied_volatility"])
+            if len(fit_df) >= 4:
+                k_arr = np.log(fit_df["strike"].values / F_val)
+                w_arr = (fit_df["implied_volatility"].values ** 2) * T
+                
+                # Apply weighting scheme
+                if calibration_weighting == "Spread-Weighted":
+                    # Weight proportional to 1 / spread^2 (inverse variance). Adding 1e-4 to avoid div by zero.
+                    weights = 1.0 / (np.maximum(fit_df["spread_pct"].values, 1e-4) ** 2)
+                elif calibration_weighting == "Vega-Weighted":
+                    weights = fit_df["vega"].values
+                else:
+                    weights = np.ones_like(w_arr)
+
+                ssvi_params = fit_ssvi_slice(k_arr, w_arr, weights=weights)
+
     # Render Plotly Smile Figure
-    fig = build_volatility_smile_chart(
+        fig = build_volatility_smile_chart(
         calls_df=calls_iv,
         puts_df=puts_iv,
         spot_price=spot_price,
         x_axis_mode=x_mode,
         show_calls=show_calls,
         show_puts=show_puts,
+        stitch_otm=stitch_otm,
         overlay_yahoo_iv=overlay_yahoo,
+        show_iv_spread=show_iv_spread,
         strike_min=strike_range[0],
         strike_max=strike_range[1],
+        ssvi_params=ssvi_params,
+        T=T,
+        r=risk_free_rate,
+        q=dividend_yield,
     )
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Display SSVI Parameters
+    if ssvi_params:
+        with st.expander("SSVI Slice Fit Parameters & Diagnostics (Gatheral & Jacquier 2014)", expanded=True):
+            st.markdown("Surface Stochastic Volatility Inspired (SSVI) fit parameterises the slice. Butterfly arbitrage condition is enforced. Calendar arbitrage requires multi-expiry calibration.")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Theta [ATM Variance]", f"{ssvi_params['theta']:.5f}")
+            s2.metric("Rho [Correlation]", f"{ssvi_params['rho']:.5f}")
+            s3.metric("Phi [Curvature]", f"{ssvi_params['phi']:.5f}")
+            
+            # Butterfly constraint: theta * phi * (1 + |rho|) <= 4
+            bf_val = ssvi_params['theta'] * ssvi_params['phi'] * (1 + abs(ssvi_params['rho']))
+            bf_pass = bf_val <= 4.00001
+            s4.metric(
+                "Butterfly Condition",
+                "PASS" if bf_pass else "FAIL",
+                help=f"theta * phi * (1 + |rho|) = {bf_val:.4f} (Must be <= 4)"
+            )
 
     # ---------------------------------------------------------
     # Analytics & Diagnostics Tabs
     # ---------------------------------------------------------
-    tab_data, tab_micro, tab_yield, tab_math, tab_scenario = st.tabs(
-        [
-            "📊 Cleaned Options Chain Data",
-            "🔍 Market Microstructure & Liquidity",
-            "📈 Yield Curve Term Structure",
-            "📐 Quantitative Math & Inversion Architecture",
-            "🛠️ Interactive Scenario Pricer",
-        ]
-    )
+    tab_data, tab_micro, tab_yield = st.tabs([
+        "Cleaned Options Chain Data",
+        "Market Microstructure & Liquidity",
+        "Yield Curve Term Structure"
+    ])
 
     with tab_data:
-        st.caption("Cleaned, order-book sanitized options contracts with numerical IV solutions.")
+        st.caption("Cleaned, order-book sanitised options contracts with numerical IV solutions.")
         sub_tab_calls, sub_tab_puts = st.tabs(["Calls Chain", "Puts Chain"])
 
         display_cols = [
@@ -695,7 +937,7 @@ def main() -> None:
                 )
                 csv_calls = calls_iv.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    label="📥 Download Calls Chain (CSV)",
+                    label="Download Calls Chain (CSV)",
                     data=csv_calls,
                     file_name=f"{ticker_input}_{selected_expiry}_calls_iv.csv",
                     mime="text/csv",
@@ -735,7 +977,7 @@ def main() -> None:
                 )
                 csv_puts = puts_iv.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    label="📥 Download Puts Chain (CSV)",
+                    label="Download Puts Chain (CSV)",
                     data=csv_puts,
                     file_name=f"{ticker_input}_{selected_expiry}_puts_iv.csv",
                     mime="text/csv",
@@ -745,6 +987,25 @@ def main() -> None:
 
     with tab_micro:
         st.caption("Order book liquidity dynamics: Bid-Ask Spreads and Trading Volume by Strike.")
+        
+        # Determine X-Axis metrics for microstructure charts
+        F_val = spot_price * np.exp((risk_free_rate - dividend_yield) * T)
+        if x_mode == "Forward Moneyness (K / F)":
+            fwd_x_micro = 1.0
+            micro_x_label = "Forward Moneyness (K / F)"
+            c_x = calls_iv["strike"] / F_val if not calls_iv.empty else []
+            p_x = puts_iv["strike"] / F_val if not puts_iv.empty else []
+        elif x_mode == "Log-Forward Moneyness ln(K / F)":
+            fwd_x_micro = 0.0
+            micro_x_label = "Log-Forward Moneyness ln(K / F)"
+            c_x = np.log(calls_iv["strike"] / F_val) if not calls_iv.empty else []
+            p_x = np.log(puts_iv["strike"] / F_val) if not puts_iv.empty else []
+        else:
+            fwd_x_micro = F_val
+            micro_x_label = "Strike Price ($)"
+            c_x = calls_iv["strike"] if not calls_iv.empty else []
+            p_x = puts_iv["strike"] if not puts_iv.empty else []
+
         col_m1, col_m2 = st.columns(2)
 
         with col_m1:
@@ -753,7 +1014,7 @@ def main() -> None:
             if not calls_iv.empty:
                 fig_spread.add_trace(
                     go.Scatter(
-                        x=calls_iv["strike"],
+                        x=c_x,
                         y=calls_iv["spread_pct"] * 100.0,
                         mode="lines+markers",
                         name="Call Bid-Ask Spread %",
@@ -763,21 +1024,23 @@ def main() -> None:
             if not puts_iv.empty:
                 fig_spread.add_trace(
                     go.Scatter(
-                        x=puts_iv["strike"],
+                        x=p_x,
                         y=puts_iv["spread_pct"] * 100.0,
                         mode="lines+markers",
                         name="Put Bid-Ask Spread %",
                         line=dict(color="#FF7043", width=1.8),
                     )
                 )
-            fig_spread.add_vline(x=spot_price, line_dash="dash", line_color="#8B949E")
+            fig_spread.add_vline(x=fwd_x_micro, line_dash="dash", line_color="#8B949E")
             fig_spread.update_layout(
-                title="Bid-Ask Spread (% of Mid-Price) vs Strike",
-                xaxis_title="Strike ($)",
-                yaxis_title="Spread %",
+                title=dict(text=f"Bid-Ask Spread (% of Mid-Price) vs {micro_x_label.split()[0]}", font=dict(size=16, color="#F0F6FC"), x=0.01, y=0.96),
+                xaxis=dict(title=dict(text=micro_x_label, font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                yaxis=dict(title=dict(text="Spread %", font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0, bgcolor="rgba(22, 27, 34, 0.8)", bordercolor="#30363D", borderwidth=1, font=dict(color="#C9D1D9")),
                 template="plotly_dark",
                 paper_bgcolor="#0D1117",
                 plot_bgcolor="#0D1117",
+                font=dict(color="#E6EDF3"),
                 height=350,
                 margin=dict(l=40, r=20, t=50, b=40),
             )
@@ -789,7 +1052,7 @@ def main() -> None:
             if not calls_iv.empty:
                 fig_vol.add_trace(
                     go.Bar(
-                        x=calls_iv["strike"],
+                        x=c_x,
                         y=calls_iv["volume"],
                         name="Call Volume",
                         marker_color="#00D4FF",
@@ -799,21 +1062,23 @@ def main() -> None:
             if not puts_iv.empty:
                 fig_vol.add_trace(
                     go.Bar(
-                        x=puts_iv["strike"],
+                        x=p_x,
                         y=puts_iv["volume"],
                         name="Put Volume",
                         marker_color="#FF7043",
                         opacity=0.7,
                     )
                 )
-            fig_vol.add_vline(x=spot_price, line_dash="dash", line_color="#8B949E")
+            fig_vol.add_vline(x=fwd_x_micro, line_dash="dash", line_color="#8B949E")
             fig_vol.update_layout(
-                title="Trading Volume Distribution by Strike",
-                xaxis_title="Strike ($)",
-                yaxis_title="Contracts Traded",
+                title=dict(text=f"Trading Volume Distribution by {micro_x_label.split()[0]}", font=dict(size=16, color="#F0F6FC"), x=0.01, y=0.96),
+                xaxis=dict(title=dict(text=micro_x_label, font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                yaxis=dict(title=dict(text="Contracts Traded", font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0, bgcolor="rgba(22, 27, 34, 0.8)", bordercolor="#30363D", borderwidth=1, font=dict(color="#C9D1D9")),
                 template="plotly_dark",
                 paper_bgcolor="#0D1117",
                 plot_bgcolor="#0D1117",
+                font=dict(color="#E6EDF3"),
                 height=350,
                 barmode="overlay",
                 margin=dict(l=40, r=20, t=50, b=40),
@@ -867,15 +1132,16 @@ def main() -> None:
             )
             
             fig_yc.update_layout(
-                title="Dynamic Risk-Free Rate Interpolation",
-                xaxis_title="Tenor (Years)",
-                yaxis_title="Yield (%)",
+                title=dict(text="Dynamic Risk-Free Rate Interpolation", font=dict(size=16, color="#F0F6FC"), x=0.01, y=0.96),
+                xaxis=dict(title=dict(text="Tenor (Years)", font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                yaxis=dict(title=dict(text="Yield (%)", font=dict(color="#C9D1D9", size=13)), showgrid=True, gridcolor="#21262D", zeroline=False, color="#8B949E"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0, bgcolor="rgba(22, 27, 34, 0.8)", bordercolor="#30363D", borderwidth=1, font=dict(color="#C9D1D9")),
                 template="plotly_dark",
                 paper_bgcolor="#0D1117",
                 plot_bgcolor="#0D1117",
+                font=dict(color="#E6EDF3"),
                 height=450,
                 margin=dict(l=40, r=20, t=50, b=40),
-                legend=dict(x=0.02, y=0.98)
             )
             st.plotly_chart(fig_yc, use_container_width=True)
             
@@ -883,223 +1149,10 @@ def main() -> None:
         except Exception as e:
             st.warning("Yield curve plot is currently unavailable.")
 
-    with tab_math:
-        st.subheader("1. Theoretical Black-Scholes Pricing Framework")
-        st.markdown(
-            "For a non-dividend paying underlying asset with spot price $S$, strike $K$, "
-            "annualized time to maturity $T$, risk-free rate $r$, and constant volatility $\\sigma$:"
-        )
-        st.latex(r"C(S, K, T, r, \sigma) = S \cdot N(d_1) - K e^{-rT} \cdot N(d_2)")
-        st.latex(r"P(S, K, T, r, \sigma) = K e^{-rT} \cdot N(-d_2) - S \cdot N(-d_1)")
-        st.markdown(
-            "where $N(x)$ denotes the standard normal cumulative distribution function (CDF), and:"
-        )
-        st.latex(
-            r"d_1 = \frac{\ln(S / K) + \left(r + \frac{1}{2}\sigma^2\right)T}{\sigma \sqrt{T}}, \quad d_2 = d_1 - \sigma \sqrt{T}"
-        )
-
-        st.divider()
-
-        st.subheader("2. Reverse-Engineering Implied Volatility (IV)")
-        st.markdown(
-            "Observed option market quotes trade at mid-price $P_{\\text{market}} = \\frac{\\text{Bid} + \\text{Ask}}{2}$. "
-            "Implied Volatility $\\sigma$ is the unique positive root satisfying the non-linear pricing equation:"
-        )
-        st.latex(r"f(\sigma) = \text{BS}(S, K, T, r, \sigma) - P_{\text{market}} = 0")
-        st.markdown(
-            "Because no closed-form analytical inverse exists for $N(d_1)$, we apply a two-tier numerical solver:"
-        )
-
-        st.markdown(
-            "**Tier 1 — Primary Solver: Newton-Raphson Method**  \n"
-            "Achieves rapid quadratic convergence utilizing the analytical Vega derivative "
-            "$\\nu = \\frac{\\partial \\text{BS}}{\\partial \\sigma} = S \\sqrt{T} \\phi(d_1)$:"
-        )
-        st.latex(
-            r"\sigma_{n+1} = \sigma_n - \frac{\text{BS}(S, K, T, r, \sigma_n) - P_{\text{market}}}{\nu(S, K, T, r, \sigma_n)}"
-        )
-
-        st.markdown(
-            "**Tier 2 — Fallback Solver: Brent's Root-Finding (`scipy.optimize.brentq`)**  \n"
-            "If Vega vanishes in deep out-of-the-money / in-the-money wings ($\\nu < 10^{-8}$) or if Newton-Raphson iterates "
-            "outside the realistic bounds $[\sigma_{\\min}, \sigma_{\\max}] = [0.01\\%, 500\\%]$, the engine immediately falls back to Brent's method. "
-            "Brent's algorithm combines bisection, secant method, and inverse quadratic interpolation, guaranteeing convergence within the bounded bracket."
-        )
-
-        st.divider()
-
-        st.subheader("3. No-Arbitrage Theoretical Boundaries")
-        st.markdown(
-            "In real-world markets, stale quotes and illiquidity can yield market prices violating lower or upper theoretical arbitrage bounds:"
-        )
-        st.latex(r"\text{Call Boundary: } \max\left(0, S - K e^{-rT}\right) < C_{\text{market}} < S")
-        st.latex(r"\text{Put Boundary: } \max\left(0, K e^{-rT} - S\right) < P_{\text{market}} < K e^{-rT}")
-        st.markdown(
-            "Our data cleaning pipeline pre-filters options violating these fundamental no-arbitrage boundaries, "
-            "preventing numerical divergence before the root-finder is invoked."
-        )
-
-
-    with tab_scenario:
-        st.subheader("Interactive Scenario Pricer & Volatility Band Analysis")
-        st.markdown("Stress test market implied volatility against your custom assumptions and evaluate Put-Call parity dynamics.")
-
-        sc_col1, sc_col2 = st.columns(2)
-        with sc_col1:
-            sc_option_type = st.radio("Option Type", ["Call", "Put"], horizontal=True, key="sc_opt_type")
-            sc_type = "call" if sc_option_type == "Call" else "put"
-        
-        valid_chain = calls_iv if sc_type == "call" else puts_iv
-        if valid_chain.empty:
-            st.warning(f"No valid {sc_option_type} options available.")
-        else:
-            with sc_col2:
-                sc_strike = st.selectbox("Select Strike Price", options=valid_chain["strike"].tolist(), key="sc_strike_sel")
-
-            selected_opt = valid_chain[valid_chain["strike"] == sc_strike].iloc[0]
-            default_iv = float(selected_opt["iv_pct"])
-            market_price = float(selected_opt["mid_price"])
-            
-            st.divider()
-
-            # State management for inputs
-            rf_key = f"sc_rf_{sc_strike}_{sc_type}"
-            iv_key = f"sc_iv_{sc_strike}_{sc_type}"
-
-            def reset_scenario():
-                st.session_state[rf_key] = float(risk_free_rate * 100)
-                st.session_state[iv_key] = default_iv
-            
-            if rf_key not in st.session_state:
-                st.session_state[rf_key] = float(risk_free_rate * 100)
-            if iv_key not in st.session_state:
-                st.session_state[iv_key] = default_iv
-
-            reset_col, _, _ = st.columns([1, 1, 2])
-            with reset_col:
-                st.button("🔄 Reset to Market Defaults", on_click=reset_scenario)
-
-            sc_in1, sc_in2 = st.columns(2)
-            with sc_in1:
-                custom_rf_pct = st.number_input(
-                    "Custom Risk-Free Rate (%)", 
-                    value=st.session_state[rf_key],
-                    step=0.1, 
-                    key=rf_key
-                )
-                custom_rf = custom_rf_pct / 100.0
-            
-            with sc_in2:
-                custom_iv_pct = st.number_input(
-                    "Custom Implied Volatility (%)", 
-                    value=st.session_state[iv_key],
-                    step=1.0, 
-                    key=iv_key
-                )
-                custom_iv = custom_iv_pct / 100.0
-
-            with st.spinner("Calculating Volatility Band..."):
-                band_df = calculate_bid_ask_iv_chain(
-                    valid_chain, 
-                    S=spot_price, 
-                    T=T, 
-                    r=custom_rf, 
-                    option_type=sc_type, 
-                    tol=solver_tol, 
-                    max_iter=max_iterations
-                )
-
-            selected_band = band_df[band_df["strike"] == sc_strike].iloc[0]
-            
-            # Countering IV logic
-            counter_chain = puts_iv if sc_type == "call" else calls_iv
-            counter_opt = counter_chain[counter_chain["strike"] == sc_strike]
-            
-            counter_iv_pct = np.nan
-            if not counter_opt.empty:
-                counter_opt_data = counter_opt.iloc[0]
-                counter_market_price = float(counter_opt_data["mid_price"])
-                counter_actual_type = "put" if sc_type == "call" else "call"
-                
-                # Calculate the synthetic/theoretical IV of the SELECTED option based on the COUNTERING option's price
-                counter_iv = calculate_countering_iv(
-                    price=counter_market_price,
-                    S=spot_price,
-                    K=sc_strike,
-                    T=T,
-                    r_custom=custom_rf,
-                    original_option_type=counter_actual_type
-                )
-                if not np.isnan(counter_iv):
-                    counter_iv_pct = counter_iv * 100.0
-
-            fig_sc = go.Figure()
-            
-            valid_band = band_df.dropna(subset=["bid_iv_pct", "ask_iv_pct"])
-            if not valid_band.empty:
-                fig_sc.add_trace(go.Scatter(
-                    x=valid_band["strike"],
-                    y=valid_band["ask_iv_pct"],
-                    mode="lines",
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip"
-                ))
-                fig_sc.add_trace(go.Scatter(
-                    x=valid_band["strike"],
-                    y=valid_band["bid_iv_pct"],
-                    mode="lines",
-                    line=dict(width=0),
-                    fill="tonexty",
-                    fillcolor="rgba(100, 181, 246, 0.2)",
-                    name="Market Volatility Band (Bid-Ask IV)"
-                ))
-
-            fig_sc.add_trace(go.Scatter(
-                x=[sc_strike],
-                y=[custom_iv_pct],
-                mode="markers",
-                marker=dict(size=14, color="#FFEA00", symbol="star", line=dict(width=2, color="black")),
-                name=f"Custom IV ({custom_iv_pct:.2f}%)"
-            ))
-
-            if not np.isnan(counter_iv_pct):
-                fig_sc.add_trace(go.Scatter(
-                    x=[sc_strike],
-                    y=[counter_iv_pct],
-                    mode="markers",
-                    marker=dict(size=12, color="#FF1744", symbol="x", line=dict(width=2, color="white")),
-                    name=f"Theoretical Countering IV ({counter_iv_pct:.2f}%)"
-                ))
-
-            fig_sc.update_layout(
-                title=f"Scenario Analysis: {sc_option_type} @ ${sc_strike:.2f} Strike",
-                xaxis_title="Strike ($)",
-                yaxis_title="Implied Volatility (%)",
-                template="plotly_dark",
-                paper_bgcolor="#0D1117",
-                plot_bgcolor="#0D1117",
-                height=500,
-                legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0.5)")
-            )
-            st.plotly_chart(fig_sc, use_container_width=True)
-
-            st.markdown("### Scenario Metrics")
-            m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            with m_col1:
-                st.metric("Market Bid IV", f"{selected_band['bid_iv_pct']:.2f}%" if not np.isnan(selected_band['bid_iv_pct']) else "N/A")
-            with m_col2:
-                delta_val = custom_iv_pct - default_iv
-                st.metric("Custom Input IV", f"{custom_iv_pct:.2f}%", delta=f"{delta_val:.2f}% vs Mid", delta_color="inverse" if delta_val > 0 else "normal")
-            with m_col3:
-                st.metric("Market Ask IV", f"{selected_band['ask_iv_pct']:.2f}%" if not np.isnan(selected_band['ask_iv_pct']) else "N/A")
-            with m_col4:
-                if not np.isnan(counter_iv_pct):
-                    pc_diff = custom_iv_pct - counter_iv_pct
-                    st.metric("Countering IV (PC Parity)", f"{counter_iv_pct:.2f}%", delta=f"{pc_diff:.2f}% Diff", delta_color="off")
-                else:
-                    st.metric("Countering IV (PC Parity)", "N/A")
-
 
 if __name__ == "__main__":
     main()
+
+
+
+

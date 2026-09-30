@@ -9,7 +9,7 @@ from typing import Literal, Optional
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
 from scipy.stats import norm
 import streamlit as st
 
@@ -61,6 +61,7 @@ def black_scholes_price(
     K: float,
     T: float,
     r: float,
+    q: float,
     sigma: float,
     option_type: OptionType = "call",
 ) -> float:
@@ -76,6 +77,8 @@ def black_scholes_price(
         Time to expiration in years (T >= 0).
     r : float
         Annualized continuously-compounded risk-free interest rate (e.g., 0.045 for 4.5%).
+    q : float
+        Annualized continuously-compounded dividend yield.
     sigma : float
         Annualized volatility of the underlying asset (sigma > 0).
     option_type : Literal['call', 'put'], default 'call'
@@ -84,10 +87,13 @@ def black_scholes_price(
     Returns
     -------
     float
-        Theoretical Black-Scholes option price.
+        Theoretical Black-Scholes-Merton option price.
     """
     if S <= 0.0 or K <= 0.0:
         return np.nan
+
+    S_adj = S * np.exp(-q * T)
+    K_adj = K * np.exp(-r * T)
 
     # Zero or negative expiration boundary: return immediate payoff
     if T <= 0.0:
@@ -97,19 +103,18 @@ def black_scholes_price(
 
     # Zero or negative volatility boundary: return discounted intrinsic value
     if sigma <= 0.0:
-        discounted_strike = K * np.exp(-r * T)
         if option_type == "call":
-            return max(0.0, S - discounted_strike)
-        return max(0.0, discounted_strike - S)
+            return max(0.0, S_adj - K_adj)
+        return max(0.0, K_adj - S_adj)
 
     sqrt_T = np.sqrt(T)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
     d2 = d1 - sigma * sqrt_T
 
     if option_type == "call":
-        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        price = S_adj * norm.cdf(d1) - K_adj * norm.cdf(d2)
     elif option_type == "put":
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        price = K_adj * norm.cdf(-d2) - S_adj * norm.cdf(-d1)
     else:
         raise ValueError(f"Invalid option_type: {option_type}. Must be 'call' or 'put'.")
 
@@ -121,11 +126,10 @@ def black_scholes_vega(
     K: float,
     T: float,
     r: float,
+    q: float,
     sigma: float,
 ) -> float:
-    """Compute the Black-Scholes Vega (dPrice / dSigma).
-
-    Vega is identical for European Call and Put options under standard assumptions.
+    """Compute the Black-Scholes-Merton Vega (dPrice / dSigma).
 
     Parameters
     ----------
@@ -137,6 +141,8 @@ def black_scholes_vega(
         Time to expiration in years.
     r : float
         Annualized risk-free interest rate.
+    q : float
+        Annualized dividend yield.
     sigma : float
         Annualized volatility.
 
@@ -148,9 +154,10 @@ def black_scholes_vega(
     if S <= 0.0 or K <= 0.0 or T <= 0.0 or sigma <= 0.0:
         return 0.0
 
+    S_adj = S * np.exp(-q * T)
     sqrt_T = np.sqrt(T)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
-    return float(S * sqrt_T * norm.pdf(d1))
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * sqrt_T)
+    return float(S_adj * sqrt_T * norm.pdf(d1))
 
 
 def implied_volatility(
@@ -159,13 +166,14 @@ def implied_volatility(
     K: float,
     T: float,
     r: float,
+    q: float,
     option_type: OptionType = "call",
     tol: float = 1e-6,
     max_iter: int = 100,
     sigma_min: float = 1e-4,
     sigma_max: float = 5.0,
 ) -> float:
-    """Reverse-engineer Black-Scholes Implied Volatility using Newton-Raphson with Brentq fallback.
+    """Reverse-engineer Black-Scholes-Merton Implied Volatility using Newton-Raphson with Brentq fallback.
 
     Parameters
     ----------
@@ -179,6 +187,8 @@ def implied_volatility(
         Time to expiration in years.
     r : float
         Annualized risk-free interest rate.
+    q : float
+        Annualized dividend yield.
     option_type : Literal['call', 'put'], default 'call'
         Option type.
     tol : float, default 1e-6
@@ -199,14 +209,16 @@ def implied_volatility(
     if price <= 0.0 or S <= 0.0 or K <= 0.0 or T <= 0.0:
         return np.nan
 
+    S_adj = S * np.exp(-q * T)
+    K_adj = K * np.exp(-r * T)
+
     # Arbitrage bounds check:
-    discounted_strike = K * np.exp(-r * T)
     if option_type == "call":
-        intrinsic = max(0.0, S - discounted_strike)
-        upper_bound = S
+        intrinsic = max(0.0, S_adj - K_adj)
+        upper_bound = S_adj
     elif option_type == "put":
-        intrinsic = max(0.0, discounted_strike - S)
-        upper_bound = discounted_strike
+        intrinsic = max(0.0, K_adj - S_adj)
+        upper_bound = K_adj
     else:
         return np.nan
 
@@ -216,18 +228,18 @@ def implied_volatility(
         return np.nan
 
     # Initial volatility estimate (Brenner-Subrahmanyam approximation anchored near ATM)
-    sigma_guess = np.sqrt(2.0 * np.pi / T) * (price / S)
+    sigma_guess = np.sqrt(2.0 * np.pi / T) * (price / S_adj)
     sigma = float(np.clip(sigma_guess, 0.10, 1.50))
 
     # Phase 1: Newton-Raphson iteration
     for _ in range(max_iter):
-        bs_p = black_scholes_price(S, K, T, r, sigma, option_type)
+        bs_p = black_scholes_price(S, K, T, r, q, sigma, option_type)
         diff = bs_p - price
 
         if abs(diff) < tol:
             return float(sigma)
 
-        vega = black_scholes_vega(S, K, T, r, sigma)
+        vega = black_scholes_vega(S, K, T, r, q, sigma)
         # Avoid division by zero or extremely flat gradient in deep wings
         if vega < 1e-8:
             break
@@ -243,7 +255,7 @@ def implied_volatility(
     # Phase 2: Robust fallback via Brent's method (scipy.optimize.brentq)
     try:
         def objective(sig: float) -> float:
-            return black_scholes_price(S, K, T, r, sig, option_type) - price
+            return black_scholes_price(S, K, T, r, q, sig, option_type) - price
 
         f_min = objective(sigma_min)
         f_max = objective(sigma_max)
@@ -264,195 +276,167 @@ def calculate_chain_implied_volatility(
     S: float,
     T: float,
     r: float,
+    q: float,
     option_type: OptionType = "call",
     tol: float = 1e-6,
     max_iter: int = 100,
 ) -> pd.DataFrame:
-    """Calculate implied volatility across an entire options chain DataFrame.
-
-    Cached via Streamlit `@st.cache_data` to ensure instantaneous UI interactions.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Cleaned options DataFrame containing at least 'strike' and 'mid_price' columns.
-    S : float
-        Current spot price of the underlying asset.
-    T : float
-        Time to expiration in years.
-    r : float
-        Risk-free interest rate.
-    option_type : Literal['call', 'put']
-        Option type.
-    tol : float, default 1e-6
-        Convergence tolerance for solver.
-    max_iter : int, default 100
-        Maximum iterations for solver.
-
-    Returns
-    -------
-    pd.DataFrame
-        Enriched DataFrame with 'implied_volatility', 'moneyness',
-        'log_moneyness', and solver convergence metadata.
-    """
     if df.empty or "strike" not in df.columns or "mid_price" not in df.columns:
         return df.copy()
 
     res = df.copy()
-    ivs = []
-    pricing_errors = []
+    ivs, bid_ivs, ask_ivs, pricing_errors, vegas = [], [], [], [], []
 
     for _, row in res.iterrows():
         k = float(row["strike"])
         p = float(row["mid_price"])
-        iv = implied_volatility(
-            price=p,
-            S=S,
-            K=k,
-            T=T,
-            r=r,
-            option_type=option_type,
-            tol=tol,
-            max_iter=max_iter,
-        )
+        bid = float(row.get("bid", 0.0))
+        ask = float(row.get("ask", 0.0))
+
+        iv = implied_volatility(p, S, k, T, r, q, option_type, tol, max_iter)
         ivs.append(iv)
+        
+        b_iv = implied_volatility(bid, S, k, T, r, q, option_type, tol, max_iter) if bid > 0 else np.nan
+        a_iv = implied_volatility(ask, S, k, T, r, q, option_type, tol, max_iter) if ask > 0 else np.nan
+        bid_ivs.append(b_iv)
+        ask_ivs.append(a_iv)
 
         if not np.isnan(iv):
-            recomputed = black_scholes_price(S, k, T, r, iv, option_type)
+            recomputed = black_scholes_price(S, k, T, r, q, iv, option_type)
             pricing_errors.append(abs(recomputed - p))
+            vegas.append(black_scholes_vega(S, k, T, r, q, iv))
         else:
             pricing_errors.append(np.nan)
+            vegas.append(np.nan)
 
     res["implied_volatility"] = ivs
     res["iv_pct"] = res["implied_volatility"] * 100.0
+    res["bid_iv"] = bid_ivs
+    res["ask_iv"] = ask_ivs
+    res["bid_iv_pct"] = res["bid_iv"] * 100.0
+    res["ask_iv_pct"] = res["ask_iv"] * 100.0
+    res["vega"] = vegas
+    
+    F = S * np.exp((r - q) * T)
     res["moneyness"] = res["strike"] / S
-    res["log_moneyness"] = np.log(res["moneyness"])
+    res["forward_moneyness"] = res["strike"] / F
+    res["log_moneyness"] = np.log(res["forward_moneyness"])
     res["solver_error"] = pricing_errors
     res["option_type"] = option_type
 
-    # Filter out rows where the solver could not converge or arbitrage boundaries were hit
     res_clean = res.dropna(subset=["implied_volatility"]).copy()
     res_clean.sort_values(by="strike", inplace=True)
     res_clean.reset_index(drop=True, inplace=True)
 
     return res_clean
 
-
-@st.cache_data(show_spinner=False)
-def calculate_bid_ask_iv_chain(
-    df: pd.DataFrame,
-    S: float,
-    T: float,
-    r: float,
-    option_type: OptionType = "call",
-    tol: float = 1e-6,
-    max_iter: int = 100,
-) -> pd.DataFrame:
-    """Calculate implied volatility for the bid and ask independently across an options chain DataFrame.
-
+def ssvi_total_variance(k: np.ndarray, theta: float, rho: float, phi: float) -> np.ndarray:
+    """Calculate SSVI total implied variance w(k) based on Gatheral & Jacquier (2014).
+    
     Parameters
     ----------
-    df : pd.DataFrame
-        Cleaned options DataFrame containing 'strike', 'bid', and 'ask' columns.
-    S : float
-        Current spot price of the underlying asset.
-    T : float
-        Time to expiration in years.
-    r : float
-        Risk-free interest rate.
-    option_type : Literal['call', 'put']
-        Option type.
-    tol : float, default 1e-6
-        Convergence tolerance for solver.
-    max_iter : int, default 100
-        Maximum iterations for solver.
-
+    k : np.ndarray
+        Log-moneyness k = ln(K / F).
+    theta : float
+        ATM total variance.
+    rho : float
+        Correlation parameter (-1 < rho < 1).
+    phi : float
+        Smile curvature parameter (phi > 0).
+        
     Returns
     -------
-    pd.DataFrame
-        Enriched DataFrame with 'bid_iv', 'ask_iv', 'bid_iv_pct', and 'ask_iv_pct'.
+    np.ndarray
+        Total variance w(k).
     """
-    if df.empty or "strike" not in df.columns or "bid" not in df.columns or "ask" not in df.columns:
-        return df.copy()
-
-    res = df.copy()
-    bid_ivs = []
-    ask_ivs = []
-
-    for _, row in res.iterrows():
-        k = float(row["strike"])
-        bid = float(row["bid"])
-        ask = float(row["ask"])
-        
-        b_iv = implied_volatility(bid, S, k, T, r, option_type, tol, max_iter) if bid > 0 else np.nan
-        a_iv = implied_volatility(ask, S, k, T, r, option_type, tol, max_iter) if ask > 0 else np.nan
-        
-        bid_ivs.append(b_iv)
-        ask_ivs.append(a_iv)
-
-    res["bid_iv"] = bid_ivs
-    res["ask_iv"] = ask_ivs
-    res["bid_iv_pct"] = res["bid_iv"] * 100.0
-    res["ask_iv_pct"] = res["ask_iv"] * 100.0
-
-    return res
+    inner = (phi * k + rho)**2 + (1.0 - rho**2)
+    inner = np.maximum(inner, 0.0) # Safety clip for floating point precision
+    return (theta / 2.0) * (1.0 + rho * phi * k + np.sqrt(inner))
 
 
-def calculate_countering_iv(
-    price: float,
-    S: float,
-    K: float,
-    T: float,
-    r_custom: float,
-    original_option_type: OptionType,
-) -> float:
-    """Calculate the theoretical countering IV based on standard Put-Call parity.
+def fit_ssvi_slice(k_array: np.ndarray, w_array: np.ndarray, weights: np.ndarray = None) -> dict:
+    """Fit SSVI parameters (theta, rho, phi) to a single volatility slice using constrained optimisation.
     
-    Uses the user-supplied custom risk-free rate to find the theoretical price of the
-    countering option, then reverse-engineers its implied volatility.
-
+    Enforces the SSVI butterfly arbitrage-free condition: theta * phi * (1 + |rho|) <= 4
+    
     Parameters
     ----------
-    price : float
-        Observed market price of the original option.
-    S : float
-        Current spot price.
-    K : float
-        Strike price.
-    T : float
-        Time to expiration in years.
-    r_custom : float
-        Custom user-supplied risk-free rate.
-    original_option_type : Literal['call', 'put']
-        The type of the original option.
-
+    k_array : np.ndarray
+        Array of log-moneyness.
+    w_array : np.ndarray
+        Array of total implied variance (sigma^2 * T).
+    weights : np.ndarray, optional
+        Weights for each observation. If None, equal weighting is used.
+        
     Returns
     -------
-    float
-        The theoretical countering implied volatility.
+    dict
+        Dictionary containing 'theta', 'rho', 'phi', and 'mse' if successful, else None.
     """
-    discounted_strike = K * np.exp(-r_custom * T)
-    
-    if original_option_type == "call":
-        # P = C - S + K * e^{-rT}
-        countering_price = price - S + discounted_strike
-        counter_type = "put"
-    elif original_option_type == "put":
-        # C = P + S - K * e^{-rT}
-        countering_price = price + S - discounted_strike
-        counter_type = "call"
+    if len(k_array) < 4:
+        return None
+        
+    # Remove NaNs
+    valid = ~np.isnan(k_array) & ~np.isnan(w_array)
+    k_array = k_array[valid]
+    w_array = w_array[valid]
+    if weights is not None:
+        weights = weights[valid]
     else:
-        return np.nan
+        weights = np.ones_like(w_array)
+        
+    if len(k_array) < 4:
+        return None
 
-    if countering_price <= 0.0:
-        return np.nan
+    # Normalize weights to sum to N so the MSE scaling remains comparable
+    if np.sum(weights) > 0:
+        weights = weights / np.sum(weights) * len(weights)
+    else:
+        weights = np.ones_like(w_array)
 
-    return implied_volatility(
-        price=countering_price,
-        S=S,
-        K=K,
-        T=T,
-        r=r_custom,
-        option_type=counter_type
-    )
+    # Initial guesses
+    idx_atm = np.argmin(np.abs(k_array))
+    theta_guess = max(float(w_array[idx_atm]), 1e-4)
+    rho_guess = 0.0
+    phi_guess = 1.0
+    
+    def objective(params):
+        theta, rho, phi = params
+        w_fit = ssvi_total_variance(k_array, theta, rho, phi)
+        # Scale MSE heavily to prevent premature SLSQP convergence on tiny variance gradients
+        return np.average((w_array - w_fit)**2, weights=weights) * 1e6
+        
+    # Bounds: theta > 0, -1 < rho < 1, phi > 0
+    bounds = ((1e-5, 2.0), (-0.999, 0.999), (1e-5, 100.0))
+    
+    # SSVI Butterfly Arbitrage-Free Condition: 4 - theta * phi * (1 + |rho|) >= 0
+    def constraint(params):
+        theta, rho, phi = params
+        return 4.0 - theta * phi * (1.0 + abs(rho))
+        
+    cons = {'type': 'ineq', 'fun': constraint}
+    
+    try:
+        res = minimize(
+            objective, 
+            x0=[theta_guess, rho_guess, phi_guess],
+            bounds=bounds,
+            constraints=cons,
+            method='SLSQP',
+            options={'maxiter': 500, 'ftol': 1e-8}
+        )
+        
+        if res.success:
+            return {
+                'theta': float(res.x[0]),
+                'rho': float(res.x[1]),
+                'phi': float(res.x[2]),
+                'mse': float(res.fun)
+            }
+    except Exception:
+        pass
+        
+    return None
+
+
 
