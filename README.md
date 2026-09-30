@@ -1,51 +1,54 @@
-# Equity Derivatives Risk: Implied Volatility Smile & Market Microstructure Engine
+# Equity Volatility Analytics: SSVI Parameterisation & Microstructure Engine
 
-Standard Black-Scholes pricing assumes constant volatility across all strike prices—a theoretical assumption consistently disproven by live options markets. This project constructs an automated pipeline to ingest intraday options chains, sanitise order book noise, and mathematically invert the Black-Scholes formula to visualize the real-world Volatility Smile (skew and kurtosis) across liquid equities.
+Standard Black-Scholes pricing assumes constant volatility across all strike prices - a theoretical assumption consistently disproven by live options markets. 
 
-## 📊 Executive Summary
-* **The Problem:** Raw options data is notoriously dirty (illiquid strikes, zero bids, massive bid-ask spreads), and standard theoretical models fail to account for how the market actually prices tail risk.
-* **The Solution:** An end-to-end quantitative architecture that dynamically ingests live chain data, filters market microstructure anomalies, and establishes clean mid-price equivalents for institutional-grade analysis.
-* **Quantitative Inversion:** A custom numerical root-finding algorithm reverse-engineers the Black-Scholes pricing model to calculate precise Implied Volatility (IV) for every valid strike, mapping both Call and Put skews simultaneously.
+This project goes beyond generic implied volatility plotting. It is a **Production-Grade Volatility Analytics Engine** designed to answer a rigorous quantitative question: *Given noisy market option quotes, how do we mathematically extract, clean, stitch, fit, and validate an arbitrage-free market-implied volatility surface?*
 
-## ⚙️ Methodology & Financial Engineering
+## Executive Summary
 
-### 1. Data Architecture & Microstructure Cleaning
-* **Live Data Feed:** Intraday options chains and underlying spot prices are ingested dynamically via the `yfinance` API.
-* **Sanitisation Pipeline:** The engine automatically strips zero-volume contracts, drops anomalous $0.00 bids, and calculates a true `mid_price` `((bid + ask) / 2)`. This prevents the root-finding algorithm from crashing or returning `NaN` on highly illiquid deep Out-of-the-Money (OTM) strikes.
-* **State Management:** Implements `@st.cache_data` to cache expensive API payloads and numerical calculations, ensuring a zero-latency, highly responsive user interface without triggering API rate limits.
+* **The Problem:** Raw options data is notoriously dirty (illiquid strikes, massive bid-ask spreads), and standard unweighted polynomial fits are highly vulnerable to both microstructure noise and calendar/butterfly arbitrage.
+* **The Solution:** An end-to-end quantitative architecture that ingests intraday chain data, enforces fundamental no-arbitrage bounds, reverse-engineers Black-Scholes Implied Volatility (IV), and calibrates a **Surface Stochastic Volatility Inspired (SSVI)** model to the data.
+* **Microstructure Immunity:** The SSVI calibration utilises an **Inverse-Variance (Spread-Weighted)** objective function, penalising illiquid OTM wings and ensuring the volatility curve tightly hugs the highly-liquid ATM quotes.
 
-### 2. Quantitative Math (Black-Scholes Inversion)
-* **Model Formulation:** Implements the core Black-Scholes-Merton equations for European calls and puts.
-* **Iterative Solver:** Because Implied Volatility cannot be isolated algebraically from the Black-Scholes equation, the engine deploys a computationally optimised iterative root-finding solver (via `scipy.optimize`) to calculate the exact volatility that equates the theoretical price to the observed market mid-price.
-* **Moneyness Normalisation:** Beyond standard Strike Price ($), the engine dynamically maps the X-axis into Moneyness ($K/S$) and Log-Moneyness ($\ln(K/S)$) spaces. This allows for standardized volatility skew analysis across different asset classes and expiration horizons.
+## Quantitative Architecture & Pipeline
 
-## 💻 Tech Stack
+The engine executes the following data flow sequentially:
+
+1. **Intraday Data Ingestion:** Live yfinance API calls for option chains and underlying spot prices.
+2. **Dynamic Risk-Free Rate Interpolation:** Queries live US Treasury tenors from the Federal Reserve (FRED) and fits a **Natural Cubic Spline** to extract the exact continuous risk-free rate r(T) for the option's maturity.
+3. **Data Sanitisation:** Discards anomalous 0.00 bids and enforces fundamental no-arbitrage bounds.
+4. **Implied Volatility Inversion:** Deploys a hybrid **Newton-Raphson / Brentq** root-finding algorithm to reverse-engineer IV from the observed mid-price.
+5. **Forward Moneyness & OTM Stitching:** Calculates the Forward Price (F) to strip out risk-free drift and dividend decay, cleanly stitching OTM calls and OTM puts in Log-Forward Moneyness space.
+6. **SSVI Calibration:** Fits the Gatheral & Jacquier (2014) SSVI formulation to the extracted smile.
+7. **Arbitrage Diagnostics:** Analytically verifies Durrleman's Butterfly Arbitrage Condition on the calibrated slice.
+
+## Tech Stack
 * **Language:** Python
-* **Quantitative Modeling:** `scipy` (numerical root-finding), custom Black-Scholes mathematics
-* **Data Manipulation:** `pandas`, `numpy`, `yfinance`
-* **Frontend & Deployment:** `streamlit`, `plotly` (interactive surface rendering), Streamlit Community Cloud
+* **Quantitative Modelling:** scipy.optimize (Numerical root-finding, SLSQP constrained optimisation), scipy.interpolate (Cubic Splines)
+* **Data Engineering:** pandas, 
+umpy, yfinance, redapi
+* **Frontend & Visualisation:** streamlit, plotly (Interactive microstructure and volatility charting)
 
-## 🚀 Access the Model
+## Access the Model
 
 **1. Live Web Application (Recommended)**  
 Access the interactive risk dashboard directly in your browser:  
-👉 [Launch Streamlit Dashboard](https://chileungmak-equity-vol-smile.streamlit.app/)
+[Launch Streamlit Dashboard](https://chileungmak-equity-vol-smile.streamlit.app/)
 
 **2. Local Execution**  
-To run the model locally, clone this repository and install the dependencies:
-```bash
+To run the quantitative engine locally:
+``bash
+git clone https://github.com/chileungmak/equity-vol-smile.git
+cd equity-vol-smile
 pip install -r requirements.txt
 python -m streamlit run app.py
-```
+``
 
-
-## 👤 Author
+## Author
 
 **Chi Leung Mak (Ron), CFA, CAIA**  
 *MSc Financial Engineering Candidate | Ex-Head of Business Analysis*  
 
-Bridging alternative investment with quantitative financial modelling. Drawing on prior experience as a real estate research analyst and head of business analysis in tech consulting to build rigorous, data-driven analytical tools. 
+Bridging alternative investments with quantitative financial modelling. Drawing on prior experience as a real estate research analyst and head of business analysis in tech consulting to build rigorous, data-driven analytical tools. 
 
-[LinkedIn](https://linkedin.com/in/clmak) • [GitHub](https://github.com/chileungmak)
-
-
+[LinkedIn](https://linkedin.com/in/clmak) | [GitHub](https://github.com/chileungmak)
