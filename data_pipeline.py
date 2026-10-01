@@ -12,6 +12,14 @@ import pandas as pd
 import pandas_datareader.data as web
 import streamlit as st
 import yfinance as yf
+import requests
+
+def _get_yf_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+    })
+    return session
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -80,7 +88,7 @@ def fetch_ticker_metadata(ticker_symbol: str) -> Dict[str, Any]:
         raise ValueError("Ticker symbol cannot be empty.")
 
     try:
-        ticker = yf.Ticker(clean_symbol)
+        ticker = yf.Ticker(clean_symbol, session=_get_yf_session())
         expirations: Tuple[str, ...] = ticker.options
     except Exception as exc:
         raise ValueError(f"Failed to query options for ticker '{clean_symbol}': {exc}") from exc
@@ -190,7 +198,7 @@ def fetch_option_chain_raw(ticker_symbol: str, expiry_date: str) -> Tuple[pd.Dat
     """
     clean_symbol = ticker_symbol.strip().upper()
     try:
-        ticker = yf.Ticker(clean_symbol)
+        ticker = yf.Ticker(clean_symbol, session=_get_yf_session())
         chain = ticker.option_chain(expiry_date)
         calls = chain.calls.copy()
         puts = chain.puts.copy()
